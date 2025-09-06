@@ -35,6 +35,10 @@ except Exception:
 
 import matplotlib.pyplot as plt
 
+# --- Helper para atualizar faixas de eixos com segurança ---
+def _queue_ranges(xmin=None, xmax=None, ymin=None, ymax=None):
+    st.session_state["_pending_ranges"] = {"x_min": xmin, "x_max": xmax, "y_min": ymin, "y_max": ymax}
+
 # --------------------- Leitura e Padronização ---------------------
 
 KNOWN_HEADER_TOKENS = {
@@ -302,6 +306,12 @@ with st.sidebar:
     legend_size = st.number_input("Tamanho da legenda", 6, 28, 12, 1)
 
     st.header("Faixas dos eixos")
+    # Aplicar pendências de ajuste rápido antes de criar widgets
+    _pend = st.session_state.pop("_pending_ranges", None)
+    if _pend:
+        for _k, _v in _pend.items():
+            if _v is not None:
+                st.session_state[_k] = _v
     if "x_min" not in st.session_state: st.session_state["x_min"] = 0.0
     if "x_max" not in st.session_state: st.session_state["x_max"] = 1000.0
     if "y_min" not in st.session_state: st.session_state["y_min"] = 0.0
@@ -411,44 +421,42 @@ if uploaded_files:
         if cA.button("Auto (justo)"):
             if Xall.size:
                 xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
-                st.session_state["x_min"] = _nice_round(xmin, base=5.0, mode="floor")
-                st.session_state["x_max"] = _nice_round(xmax, base=5.0, mode="ceil")
+                _queue_ranges(_nice_round(xmin, 5.0, "floor"), _nice_round(xmax, 5.0, "ceil"), None, None)
+                st.rerun()
             if Yt_all.size:
                 ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
-                st.session_state["y_min"] = _nice_round(ymin, base=1.0, mode="floor")
-                st.session_state["y_max"] = _nice_round(ymax, base=1.0, mode="ceil")
+                _queue_ranges(None, None, _nice_round(ymin, 1.0, "floor"), _nice_round(ymax, 1.0, "ceil"))
+                st.rerun()
 
         if cB.button("Auto (+10% margem)"):
             if Xall.size:
                 xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
                 pad = 0.1 * max(1e-9, xmax - xmin)
-                st.session_state["x_min"] = _nice_round(xmin - pad, base=5.0, mode="floor")
-                st.session_state["x_max"] = _nice_round(xmax + pad, base=5.0, mode="ceil")
+                _queue_ranges(_nice_round(xmin - pad, 5.0, "floor"), _nice_round(xmax + pad, 5.0, "ceil"), None, None)
+                st.rerun()
             if Yt_all.size:
                 ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
                 pad = 0.1 * max(1e-9, ymax - ymin)
-                st.session_state["y_min"] = _nice_round(ymin - pad, base=1.0, mode="floor")
-                st.session_state["y_max"] = _nice_round(ymax + pad, base=1.0, mode="ceil")
+                _queue_ranges(None, None, _nice_round(ymin - pad, 1.0, "floor"), _nice_round(ymax + pad, 1.0, "ceil"))
+                st.rerun()
 
         if cC.button("Quantis 1–99%"):
             if Xall.size:
                 xmin, xmax = np.nanquantile(Xall, 0.01), np.nanquantile(Xall, 0.99)
-                st.session_state["x_min"] = float(xmin)
-                st.session_state["x_max"] = float(xmax)
+                _queue_ranges(float(xmin), float(xmax), None, None)
+                st.rerun()
             if Yt_all.size:
                 ymin, ymax = np.nanquantile(Yt_all, 0.01), np.nanquantile(Yt_all, 0.99)
-                st.session_state["y_min"] = float(ymin)
-                st.session_state["y_max"] = float(ymax)
+                _queue_ranges(None, None, float(ymin), float(ymax))
+                st.rerun()
 
         if cD.button("Y = 0–100%"):
-            st.session_state["y_min"] = 0.0
-            st.session_state["y_max"] = 100.0
+            _queue_ranges(None, None, 0.0, 100.0)
+            st.rerun()
 
         if cE.button("Redefinir (padrão)"):
-            st.session_state["x_min"] = 0.0
-            st.session_state["x_max"] = 1000.0
-            st.session_state["y_min"] = 0.0
-            st.session_state["y_max"] = 110.0
+            _queue_ranges(0.0, 1000.0, 0.0, 110.0)
+            st.rerun()
         
                 # ---------- Gráfico TGA ----------
         st.subheader("Gráfico Combinado — TGA")
@@ -513,6 +521,7 @@ if uploaded_files:
         st.caption("Dica: use SVG para edição vetorial em softwares como Inkscape/Illustrator; use PNG com DPI alto para publicação.")
 else:
     st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
 
 
 
