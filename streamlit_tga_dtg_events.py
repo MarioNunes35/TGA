@@ -302,10 +302,14 @@ with st.sidebar:
     legend_size = st.number_input("Tamanho da legenda", 6, 28, 12, 1)
 
     st.header("Faixas dos eixos")
-    x_min = st.number_input("X min (°C)", value=0.0, step=1.0)
-    x_max = st.number_input("X max (°C)", value=1000.0, step=1.0)
-    y_min = st.number_input("Y min (m%)", value=0.0, step=1.0)
-    y_max = st.number_input("Y max (m%)", value=110.0, step=1.0)
+    if "x_min" not in st.session_state: st.session_state["x_min"] = 0.0
+    if "x_max" not in st.session_state: st.session_state["x_max"] = 1000.0
+    if "y_min" not in st.session_state: st.session_state["y_min"] = 0.0
+    if "y_max" not in st.session_state: st.session_state["y_max"] = 110.0
+    x_min = st.number_input("X min (°C)", key="x_min", step=1.0)
+    x_max = st.number_input("X max (°C)", key="x_max", step=1.0)
+    y_min = st.number_input("Y min (m%)", key="y_min", step=1.0)
+    y_max = st.number_input("Y max (m%)", key="y_max", step=1.0)
 
     st.header("Exportação")
     dpi_export = st.slider("DPI para exportação", min_value=150, max_value=1200, value=600, step=50)
@@ -366,7 +370,87 @@ if uploaded_files:
             include_series[name] = include
             style_cfg[name] = {"label": label, "color": color, "lw": lw}
 
-        # ---------- Gráfico TGA ----------
+
+        # ---------- Ajuste rápido de faixas (1 clique) ----------
+        def _nice_round(v, base=5.0, mode="floor"):
+            if not np.isfinite(v): 
+                return v
+            import math
+            if mode == "floor":
+                return base * math.floor(v / base)
+            elif mode == "ceil":
+                return base * math.ceil(v / base)
+            return v
+
+        def _compute_bounds(data_dict, include_dict):
+            xs, ys_tga, ys_dtg = [], [], []
+            for nm, d in data_dict.items():
+                if not include_dict.get(nm, True):
+                    continue
+                xs.append(d["Temperature"].to_numpy())
+                ys_tga.append(d["Mass_pct"].to_numpy())
+                ys_dtg.append(d["DTG_(-%/°C)"].to_numpy())
+            if xs:
+                X = np.concatenate(xs)
+            else:
+                X = np.array([])
+            if ys_tga:
+                Yt = np.concatenate(ys_tga)
+            else:
+                Yt = np.array([])
+            if ys_dtg:
+                Yd = np.concatenate(ys_dtg)
+            else:
+                Yd = np.array([])
+            return X, Yt, Yd
+
+        st.subheader("Ajuste rápido (X/Y)")
+        Xall, Yt_all, Yd_all = _compute_bounds(all_processed, include_series)
+
+        cA, cB, cC, cD, cE = st.columns(5)
+        if cA.button("Auto (justo)"):
+            if Xall.size:
+                xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
+                st.session_state["x_min"] = _nice_round(xmin, base=5.0, mode="floor")
+                st.session_state["x_max"] = _nice_round(xmax, base=5.0, mode="ceil")
+            if Yt_all.size:
+                ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
+                st.session_state["y_min"] = _nice_round(ymin, base=1.0, mode="floor")
+                st.session_state["y_max"] = _nice_round(ymax, base=1.0, mode="ceil")
+
+        if cB.button("Auto (+10% margem)"):
+            if Xall.size:
+                xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
+                pad = 0.1 * max(1e-9, xmax - xmin)
+                st.session_state["x_min"] = _nice_round(xmin - pad, base=5.0, mode="floor")
+                st.session_state["x_max"] = _nice_round(xmax + pad, base=5.0, mode="ceil")
+            if Yt_all.size:
+                ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
+                pad = 0.1 * max(1e-9, ymax - ymin)
+                st.session_state["y_min"] = _nice_round(ymin - pad, base=1.0, mode="floor")
+                st.session_state["y_max"] = _nice_round(ymax + pad, base=1.0, mode="ceil")
+
+        if cC.button("Quantis 1–99%"):
+            if Xall.size:
+                xmin, xmax = np.nanquantile(Xall, 0.01), np.nanquantile(Xall, 0.99)
+                st.session_state["x_min"] = float(xmin)
+                st.session_state["x_max"] = float(xmax)
+            if Yt_all.size:
+                ymin, ymax = np.nanquantile(Yt_all, 0.01), np.nanquantile(Yt_all, 0.99)
+                st.session_state["y_min"] = float(ymin)
+                st.session_state["y_max"] = float(ymax)
+
+        if cD.button("Y = 0–100%"):
+            st.session_state["y_min"] = 0.0
+            st.session_state["y_max"] = 100.0
+
+        if cE.button("Redefinir (padrão)"):
+            st.session_state["x_min"] = 0.0
+            st.session_state["x_max"] = 1000.0
+            st.session_state["y_min"] = 0.0
+            st.session_state["y_max"] = 110.0
+        
+                # ---------- Gráfico TGA ----------
         st.subheader("Gráfico Combinado — TGA")
         fig1, ax1 = plt.subplots()
         for name, d in all_processed.items():
@@ -429,6 +513,7 @@ if uploaded_files:
         st.caption("Dica: use SVG para edição vetorial em softwares como Inkscape/Illustrator; use PNG com DPI alto para publicação.")
 else:
     st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
 
 
 
