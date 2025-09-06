@@ -1,5 +1,4 @@
-
-# streamlit_tga_dtg_events.py (hardened)
+# streamlit_tga_dtg_events.py (fixed)
 import io
 import re
 import numpy as np
@@ -128,37 +127,59 @@ def _normalize_and_automap(df: pd.DataFrame):
     return df, guess
 
 def apply_plotly_layout(fig, title_text, ytitle, title_size, label_size, tick_size, legend_size):
-    layout = dict(
-        template="plotly_white",
-        xaxis_title="Temperatura (°C)",
-        yaxis_title=ytitle,
-        title_text=title_text,
-        title_font_size=_safe_font_size(title_size, 16),
-    )
-    xaxis = dict(
-        tickfont=dict(size=_safe_font_size(tick_size, 12)),
-        titlefont=dict(size=_safe_font_size(label_size, 14)),
-    )
-    yaxis = dict(
-        tickfont=dict(size=_safe_font_size(tick_size, 12)),
-        titlefont=dict(size=_safe_font_size(label_size, 14)),
-    )
-
+    # Safely get font sizes
+    safe_title_size = _safe_font_size(title_size, 16)
+    safe_label_size = _safe_font_size(label_size, 14)
+    safe_tick_size = _safe_font_size(tick_size, 12)
+    safe_legend_size = _safe_font_size(legend_size, 12)
+    
+    # Get ranges safely
     x_rng = _sanitized_range(st.session_state.get("x_min"), st.session_state.get("x_max"))
     y_rng = _sanitized_range(st.session_state.get("y_min"), st.session_state.get("y_max"))
+    
+    # Build layout dict step by step
+    layout = {
+        "template": "plotly_white",
+        "title": {
+            "text": title_text,
+            "font": {"size": safe_title_size}
+        },
+        "xaxis": {
+            "title": {
+                "text": "Temperatura (°C)",
+                "font": {"size": safe_label_size}
+            },
+            "tickfont": {"size": safe_tick_size}
+        },
+        "yaxis": {
+            "title": {
+                "text": ytitle,
+                "font": {"size": safe_label_size}
+            },
+            "tickfont": {"size": safe_tick_size}
+        },
+        "legend": {
+            "font": {"size": safe_legend_size}
+        }
+    }
+    
+    # Add ranges if they're valid
     if x_rng is not None:
-        xaxis["range"] = x_rng
+        layout["xaxis"]["range"] = x_rng
     if y_rng is not None:
-        yaxis["range"] = y_rng
-
-    layout["xaxis"] = xaxis
-    layout["yaxis"] = yaxis
-
-    leg = _safe_font_size(legend_size, None)
-    if leg is not None:
-        layout["legend"] = dict(font=dict(size=leg))
-
-    fig.update_layout(**layout)
+        layout["yaxis"]["range"] = y_rng
+    
+    try:
+        fig.update_layout(layout)
+    except Exception as e:
+        st.error(f"Error updating layout: {e}")
+        # Fallback to basic layout
+        fig.update_layout(
+            template="plotly_white",
+            title=title_text,
+            xaxis_title="Temperatura (°C)",
+            yaxis_title=ytitle
+        )
 
 # ------------------------ Leitura robusta ------------------------
 def robust_read_to_df(content_bytes: bytes, decimal_hint: str = "."):
@@ -260,52 +281,55 @@ if uploaded_files:
 
     st.subheader("Mapeamento de Colunas")
     for f in uploaded_files:
-        df_raw, mapping_guess, header_row, sep_used = robust_read_to_df(
-            f.getvalue(), decimal_hint=decimal_hint
-        )
-        st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
-
-        df_raw, guess2 = _normalize_and_automap(df_raw)
-        if isinstance(mapping_guess, dict):
-            mapping_guess.update({k: v for k, v in guess2.items() if v})
-
-        cols = list(df_raw.columns)
-
-        t_default = cols.index(mapping_guess.get("temperature", cols[0])) if cols else 0
-        col_temp = st.selectbox(
-            f"Temperatura ({f.name})",
-            cols, index=t_default,
-            key=f"{f.name}_temp"
-        )
-
-        mass_options = ["(nenhuma)"] + cols
-        m_default = mass_options.index(mapping_guess.get("mass")) if mapping_guess.get("mass") in cols else 0
-        col_mass = st.selectbox(
-            f"Massa (g/mg) ({f.name})",
-            mass_options, index=m_default,
-            key=f"{f.name}_mass"
-        )
-
-        mpct_options = ["(nenhuma)"] + cols
-        mp_default = mpct_options.index(mapping_guess.get("mass_pct")) if mapping_guess.get("mass_pct") in cols else 0
-        col_mpct = st.selectbox(
-            f"Massa % ({f.name})",
-            mpct_options, index=mp_default,
-            key=f"{f.name}_mpct"
-        )
-
-        mapping = {"temperature": col_temp}
-        if col_mass != "(nenhuma)":
-            mapping["mass"] = col_mass
-        if col_mpct != "(nenhuma)":
-            mapping["mass_pct"] = col_mpct
-        mapping_per_file[f.name] = mapping
-
         try:
-            df_proc = process_single(df_raw, mapping, baseline_mode=baseline_mode)
-            all_processed[f.name] = df_proc
+            df_raw, mapping_guess, header_row, sep_used = robust_read_to_df(
+                f.getvalue(), decimal_hint=decimal_hint
+            )
+            st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
+
+            df_raw, guess2 = _normalize_and_automap(df_raw)
+            if isinstance(mapping_guess, dict):
+                mapping_guess.update({k: v for k, v in guess2.items() if v})
+
+            cols = list(df_raw.columns)
+
+            t_default = cols.index(mapping_guess.get("temperature", cols[0])) if cols else 0
+            col_temp = st.selectbox(
+                f"Temperatura ({f.name})",
+                cols, index=t_default,
+                key=f"{f.name}_temp"
+            )
+
+            mass_options = ["(nenhuma)"] + cols
+            m_default = mass_options.index(mapping_guess.get("mass")) if mapping_guess.get("mass") in cols else 0
+            col_mass = st.selectbox(
+                f"Massa (g/mg) ({f.name})",
+                mass_options, index=m_default,
+                key=f"{f.name}_mass"
+            )
+
+            mpct_options = ["(nenhuma)"] + cols
+            mp_default = mpct_options.index(mapping_guess.get("mass_pct")) if mapping_guess.get("mass_pct") in cols else 0
+            col_mpct = st.selectbox(
+                f"Massa % ({f.name})",
+                mpct_options, index=mp_default,
+                key=f"{f.name}_mpct"
+            )
+
+            mapping = {"temperature": col_temp}
+            if col_mass != "(nenhuma)":
+                mapping["mass"] = col_mass
+            if col_mpct != "(nenhuma)":
+                mapping["mass_pct"] = col_mpct
+            mapping_per_file[f.name] = mapping
+
+            try:
+                df_proc = process_single(df_raw, mapping, baseline_mode=baseline_mode)
+                all_processed[f.name] = df_proc
+            except Exception as e:
+                st.error(f"{f.name}: erro — {e}")
         except Exception as e:
-            st.error(f"{f.name}: erro — {e}")
+            st.error(f"Erro ao processar {f.name}: {e}")
 
     if not all_processed:
         st.stop()
@@ -337,27 +361,30 @@ if uploaded_files:
     # --------- Gráfico TGA ---------
     st.subheader("Gráfico Combinado — TGA")
     if PLOTLY_OK:
-        fig1 = go.Figure()
-        for name, d in all_processed.items():
-            if not include_series.get(name, True):
-                continue
-            cfg = style_cfg[name]
-            fig1.add_trace(go.Scatter(
-                x=d["Temperature"], y=d["Mass_pct"], mode="lines",
-                name=cfg["label"],
-                line=dict(color=cfg["color"], width=float(cfg["lw"]))
-            ))
-        apply_plotly_layout(
-            fig1,
-            title_text="TGA — Massa (%) vs Temperatura",
-            ytitle="Massa (%)",
-            title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
-        )
-        st.plotly_chart(fig1, use_container_width=True, config={
-            "displaylogo": False,
-            "scrollZoom": True,
-            "modeBarButtonsToRemove": []
-        })
+        try:
+            fig1 = go.Figure()
+            for name, d in all_processed.items():
+                if not include_series.get(name, True):
+                    continue
+                cfg = style_cfg[name]
+                fig1.add_trace(go.Scatter(
+                    x=d["Temperature"], y=d["Mass_pct"], mode="lines",
+                    name=cfg["label"],
+                    line=dict(color=cfg["color"], width=float(cfg["lw"]))
+                ))
+            apply_plotly_layout(
+                fig1,
+                title_text="TGA — Massa (%) vs Temperatura",
+                ytitle="Massa (%)",
+                title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
+            )
+            st.plotly_chart(fig1, use_container_width=True, config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": []
+            })
+        except Exception as e:
+            st.error(f"Erro ao criar gráfico TGA: {e}")
     else:
         fig1, ax1 = plt.subplots(figsize=(8, 5), dpi=110)
         for name, d in all_processed.items():
@@ -379,27 +406,30 @@ if uploaded_files:
     # --------- Gráfico DTG ---------
     st.subheader("Gráfico Combinado — DTG")
     if PLOTLY_OK:
-        fig2 = go.Figure()
-        for name, d in all_processed.items():
-            if not include_series.get(name, True):
-                continue
-            cfg = style_cfg[name]
-            fig2.add_trace(go.Scatter(
-                x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
-                name=cfg["label"],
-                line=dict(color=cfg["color"], width=float(cfg["lw"]))
-            ))
-        apply_plotly_layout(
-            fig2,
-            title_text="DTG — Derivada da Massa (%)",
-            ytitle="-d(M%)/dT (%/°C)",
-            title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
-        )
-        st.plotly_chart(fig2, use_container_width=True, config={
-            "displaylogo": False,
-            "scrollZoom": True,
-            "modeBarButtonsToRemove": []
-        })
+        try:
+            fig2 = go.Figure()
+            for name, d in all_processed.items():
+                if not include_series.get(name, True):
+                    continue
+                cfg = style_cfg[name]
+                fig2.add_trace(go.Scatter(
+                    x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
+                    name=cfg["label"],
+                    line=dict(color=cfg["color"], width=float(cfg["lw"]))
+                ))
+            apply_plotly_layout(
+                fig2,
+                title_text="DTG — Derivada da Massa (%)",
+                ytitle="-d(M%)/dT (%/°C)",
+                title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
+            )
+            st.plotly_chart(fig2, use_container_width=True, config={
+                "displaylogo": False,
+                "scrollZoom": True,
+                "modeBarButtonsToRemove": []
+            })
+        except Exception as e:
+            st.error(f"Erro ao criar gráfico DTG: {e}")
     else:
         fig2, ax2 = plt.subplots(figsize=(8, 5), dpi=110)
         for name, d in all_processed.items():
