@@ -361,11 +361,11 @@ if uploaded_files:
         st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
 
         cols = list(df_raw.columns)
-col_temp = st.selectbox(f"Temperatura ({f.name})", cols, index=(cols.index(mapping_guess.get("temperature")) if mapping_guess.get("temperature") in cols else 0), key=f"{f.name}_temp")
-col_mass = st.selectbox(f"Massa (g/mg) ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass")) + 1) if mapping_guess.get("mass") in cols else 0), key=f"{f.name}_mass")
-col_mpct = st.selectbox(f"Massa % ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass_pct")) + 1) if mapping_guess.get("mass_pct") in cols else 0), key=f"{f.name}_mpct")
+        col_temp = st.selectbox(f"Temperatura ({f.name})", cols, index=(cols.index(mapping_guess.get("temperature")) if mapping_guess.get("temperature") in cols else 0), key=f"{f.name}_temp")
+        col_mass = st.selectbox(f"Massa (g/mg) ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass")) + 1) if mapping_guess.get("mass") in cols else 0), key=f"{f.name}_mass")
+        col_mpct = st.selectbox(f"Massa % ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass_pct")) + 1) if mapping_guess.get("mass_pct") in cols else 0), key=f"{f.name}_mpct")
 
-mapping = {"temperature": col_temp}
+        mapping = {"temperature": col_temp}
         if col_mass != "(nenhuma)": mapping["mass"] = col_mass
         if col_mpct != "(nenhuma)": mapping["mass_pct"] = col_mpct
         mapping_per_file[f.name] = mapping
@@ -581,6 +581,15 @@ mapping = {"temperature": col_temp}
             )
 else:
     st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
+
+
+
+
+
+
+
+
 
 
 
