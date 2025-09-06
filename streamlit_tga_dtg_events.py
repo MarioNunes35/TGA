@@ -324,7 +324,14 @@ if uploaded_files:
             mapping_per_file[f.name] = mapping
 
             try:
-                df_proc = process_single(df_raw, mapping, baseline_mode=baseline_mode)
+                df_proc = process_single(
+                    df_raw, mapping, 
+                    baseline_mode=baseline_mode,
+                    smooth_method=smooth_method,
+                    smooth_window=smooth_window,
+                    smooth_sigma=smooth_sigma,
+                    smooth_polyorder=smooth_polyorder
+                )
                 all_processed[f.name] = df_proc
             except Exception as e:
                 st.error(f"{f.name}: erro — {e}")
