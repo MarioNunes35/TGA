@@ -1,309 +1,312 @@
-# Streamlit – TGA/DTG Plotter with Noise Filtering & Event Detection
-# Author: ChatGPT (GPT-5 Thinking)
-# Description:
-#   • Load one or multiple TGA datasets (CSV) with Temperature and Mass.
-#   • Clean/normalize mass, smooth with Savitzky–Golay, compute derivative DTG (d(m%)/dT).
-#   • Automatically detect thermal events (mass-loss steps) from DTG peaks.
-#   • For each event, estimate Tonset/Tpeak/Tend and mass loss (%), plus final residue.
-#   • Interactive Plotly charts (TGA and DTG), shaded event windows, and CSV exports.
+# app.py — Limpar cabeçalho e padronizar nomes (time, temperature, mass, mass_pct)
 
+import re
 import io
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
+import os
+import unicodedata
 import streamlit as st
-import plotly.graph_objects as go
-from scipy.signal import savgol_filter, find_peaks
 
-st.set_page_config(page_title="TGA • DTG • Eventos", page_icon="🔥", layout="wide")
+st.set_page_config(page_title="Limpar Cabeçalho TXT (TGA/DTG)", page_icon="🧹", layout="centered")
+st.title("🧹 Limpar Cabeçalho de TXT (com padronização TGA/DTG)")
 
-# ------------------------------ Data Model ------------------------------- #
-@dataclass
-class Event:
-    idx_left: int
-    idx_peak: int
-    idx_right: int
-    Tonset: float
-    Tpeak: float
-    Tend: float
-    mass_loss_pct: float
+st.write(
+    "Envie um `.txt` com cabeçalho + tabela. O app detecta a tabela, "
+    "remove o cabeçalho extra e exporta um TXT com colunas padronizadas: "
+    "`time`, `temperature`, `mass`, `mass_pct` (quando aplicável)."
+)
 
-@dataclass
-class SampleResult:
-    name: str
-    residue_pct: float
-    events: List[Event]
+# --------------------------
+# Helpers
+# --------------------------
+NUM_RE = re.compile(r'^[+-]?((\d+(\.\d*)?)|(\.\d+))([eE][+-]?\d+)?$')
 
-# ------------------------------ Utilities -------------------------------- #
-def robust_read_csv(file, decimal: str = '.') -> pd.DataFrame:
-    """Read CSV trying default pandas parsing with specified decimal."""
-    try:
-        return pd.read_csv(file, decimal=decimal)
-    except Exception:
-        # fallback: try semicolon
+def split_tokens(line: str):
+    return re.findall(r'\S+', line.strip())
+
+def is_numeric_token(tok: str) -> bool:
+    return bool(NUM_RE.match(tok.replace(",", ".")))
+
+def strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
+
+def norm_token(s: str) -> str:
+    s = strip_accents(s).lower()
+    s = re.sub(r'[\[\]\(\)°%]', '', s)
+    s = re.sub(r'[^a-z0-9]+', ' ', s).strip()
+    return s
+
+def looks_like_column_header(line: str) -> bool:
+    tokens = split_tokens(line)
+    if len(tokens) < 2:
+        return False
+    alpha_tokens = sum(any(ch.isalpha() for ch in t) and not any(ch.isdigit() for ch in t) for t in tokens)
+    has_colon = any(':' in t for t in tokens)
+    return (alpha_tokens >= 2) and (not has_colon)
+
+def find_table_start(lines):
+    step_positions = [i for i, ln in enumerate(lines) if "[step]" in ln.lower()]
+    search_starts = step_positions + [0]
+    for start in search_starts:
+        for i in range(start, len(lines) - 2):
+            if looks_like_column_header(lines[i]):
+                header_idx = i
+                units_idx = i + 1
+                data_idx = i + 2
+                if data_idx < len(lines) - 1:
+                    t1 = split_tokens(lines[data_idx])
+                    t2 = split_tokens(lines[data_idx + 1])
+                    if len(t1) >= 2 and len(t2) >= 2:
+                        nratio1 = sum(is_numeric_token(x) for x in t1) / max(1, len(t1))
+                        nratio2 = sum(is_numeric_token(x) for x in t2) / max(1, len(t2))
+                        if nratio1 >= 0.6 and nratio2 >= 0.6:
+                            return header_idx, units_idx, data_idx
+    # fallback
+    for i in range(len(lines) - 6):
+        t0 = split_tokens(lines[i])
+        if len(t0) < 2:
+            continue
+        nratio0 = sum(is_numeric_token(x) for x in t0) / len(t0)
+        if nratio0 < 0.6:
+            continue
+        num_cols = len(t0)
+        good = True
+        for k in range(1, 6):
+            tk = split_tokens(lines[i + k])
+            if len(tk) < 2:
+                good = False; break
+            nratio = sum(is_numeric_token(x) for x in tk) / len(tk)
+            if nratio < 0.6 or abs(len(tk) - num_cols) > 1:
+                good = False; break
+        if good:
+            return None, None, i
+    return None, None, None
+
+def build_dataframe_like(lines, idx_header, idx_units, idx_data, max_rows_preview=50):
+    col_names = split_tokens(lines[idx_header]) if idx_header is not None else None
+    units_line = split_tokens(lines[idx_units]) if idx_units is not None else None
+
+    rows = []
+    num_cols_target = None
+    for j in range(idx_data, len(lines)):
+        ln = lines[j].strip()
+        if not ln: break
+        if ln.startswith('[') and ln.endswith(']'): break
+        toks = split_tokens(ln)
+        if len(toks) < 2: continue
+        if any(k in ln.lower() for k in (":", "segment", "started", "version", "entry", "log", "calibration")):
+            continue
+        if num_cols_target is None:
+            num_cols_target = len(toks)
+        elif abs(len(toks) - num_cols_target) > 1:
+            break
+        rows.append(toks)
+    if not col_names:
+        n = max((len(r) for r in rows), default=0)
+        col_names = [f"col{i+1}" for i in range(n)]
+
+    # Ajuste de colunas
+    ncols = len(col_names)
+    clean_rows = []
+    for r in rows:
+        if len(r) == ncols:
+            clean_rows.append(r)
+        elif len(r) == ncols - 1:
+            clean_rows.append(r + [""])
+        elif len(r) > ncols:
+            clean_rows.append(r[:ncols])
+
+    return col_names, units_line, clean_rows
+
+def make_txt(col_names, rows, sep, include_header=True, decimal_to_dot=False):
+    def fix_decimal(tok: str) -> str:
+        return tok.replace(",", ".") if decimal_to_dot else tok
+    out = io.StringIO()
+    if include_header and col_names:
+        out.write(sep.join(col_names) + "\n")
+    for r in rows:
+        out.write(sep.join(fix_decimal(x) for x in r) + "\n")
+    return out.getvalue()
+
+# --- Nova lógica: padronizar cabeçalhos ---
+def standardize_header(col_names, units=None, sample_rows=None):
+    """
+    Tenta mapear para: time, temperature, mass, mass_pct (quando fizer sentido).
+    Usa (1) nomes, (2) unidades e (3) heurística numérica dos dados.
+    """
+    N = len(col_names)
+    units = units or [""] * N
+
+    # 1) candidatos por coluna
+    candidates = []
+    for i in range(N):
+        name = norm_token(col_names[i])
+        unit = norm_token(units[i])
+        cand = None
+        # time
+        if "time" in name or "tempo" in name or unit in ("s", "min", "ms"):
+            cand = "time"
+        # temperature
+        if cand is None and ("temp" in name or "temperat" in name or "c" == unit or "oc" in unit or "k" == unit):
+            cand = "temperature"
+        # mass/weight
+        if cand is None and (("weight" in name) or ("mass" in name) or ("massa" in name)):
+            if "%" in units[i] or "percent" in unit or "pct" in unit:
+                cand = "mass_pct"
+            elif any(u in unit for u in ("g", "kg", "mg", "ug")):
+                cand = "mass"
+            else:
+                cand = "mass"  # provisório; resolvemos abaixo por heurística
+        candidates.append(cand)
+
+    # 2) Heurística para duplicado weight sem unidades (ex.: Weight, Weight)
+    #    Se houver duas 'mass', marque a com valores ~100 como mass_pct.
+    if sample_rows and candidates.count("mass") >= 2:
+        # pega colunas mass
+        mass_idxs = [i for i,c in enumerate(candidates) if c == "mass"]
+        # média da 1ª linha para cada coluna
+        first = sample_rows[0]
         try:
-            return pd.read_csv(file, sep=';', decimal=decimal)
-        except Exception as e:
-            raise e
+            vals = []
+            for idx in mass_idxs:
+                v = float(first[idx].replace(",", "."))
+                vals.append((idx, v))
+            # coluna cujo valor está em [60..120] provavelmente é %
+            idx_pct = None
+            for idx, v in vals:
+                if 60 <= v <= 120:
+                    idx_pct = idx; break
+            if idx_pct is not None:
+                # marca como mass_pct; mantém a outra como mass
+                for i in mass_idxs:
+                    candidates[i] = "mass_pct" if i == idx_pct else "mass"
+        except Exception:
+            pass
 
-
-def normalize_mass(mass: np.ndarray, assume_percent: bool, normalize_start: bool) -> np.ndarray:
-    m = mass.astype(float)
-    if not assume_percent:
-        # assume raw mass in mg or arbitrary units: normalize to initial = 100%
-        m = (m / max(m[0], 1e-12)) * 100.0
-    elif normalize_start:
-        m = (m / max(m[0], 1e-12)) * 100.0
-    return m
-
-
-def linear_drift_correction(T: np.ndarray, m_pct: np.ndarray, n_head: int = 50, n_tail: int = 50) -> np.ndarray:
-    """Fit a line using first n_head and last n_tail points and subtract it from mass curve.
-    Keeps mean level by re-adding average of endpoints. Useful for buoyancy drift.
-    """
-    n = len(T)
-    idx = np.r_[np.arange(min(n_head, n)), np.arange(max(0, n - n_tail), n)]
-    x = T[idx]
-    y = m_pct[idx]
-    if len(x) < 2:
-        return m_pct
-    A = np.vstack([x, np.ones_like(x)]).T
-    slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
-    baseline = slope * T + intercept
-    corrected = m_pct - (baseline - np.mean([y[0], y[-1]]))
-    return corrected
-
-
-def compute_dtg(T: np.ndarray, m_pct: np.ndarray, sg_window: int, sg_poly: int, deriv_smooth: bool) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (m_smooth_pct, dtg) where dtg = d(m%)/dT (percentage points per °C)."""
-    if deriv_smooth:
-        # smooth and derive in one pass
-        if sg_window % 2 == 0:
-            sg_window += 1
-        m_sm = savgol_filter(m_pct, window_length=max(5, sg_window), polyorder=sg_poly)
-        dtg = savgol_filter(m_pct, window_length=max(5, sg_window), polyorder=sg_poly, deriv=1, delta=np.mean(np.diff(T)))
-    else:
-        m_sm = m_pct
-        # finite differences
-        dT = np.gradient(T)
-        dtg = np.gradient(m_pct, dT)
-    return m_sm, dtg
-
-
-def detect_events(T: np.ndarray, dtg: np.ndarray, mass_pct: np.ndarray, prominence: float, width_pts: int, frac_height: float) -> List[Event]:
-    """Detect negative DTG peaks as mass-loss events.
-    - prominence: minimum prominence on -DTG
-    - width_pts: minimum width in points
-    - frac_height: fraction of peak magnitude to define left/right bounds
-    """
-    # Peaks of mass loss are negative in DTG; look for peaks on -dtg
-    inv = -dtg
-    pk, props = find_peaks(inv, prominence=prominence, width=width_pts)
-    events: List[Event] = []
-    for p in pk:
-        amp = inv[p]
-        thr = frac_height * amp
-        # Left bound: move left until inv < thr or start reached
-        i = int(p)
-        while i > 0 and inv[i] > thr:
-            i -= 1
-        left = i
-        # Right bound
-        j = int(p)
-        while j < len(inv) - 1 and inv[j] > thr:
-            j += 1
-        right = j
-        if right <= left + 2:
+    # 3) resolve conflitos restantes atribuindo nomes únicos
+    used = {}
+    out = [""] * N
+    for i, cand in enumerate(candidates):
+        if cand is None:
+            # fallback por posição
+            out[i] = norm_token(col_names[i]).replace(" ", "_") or f"col{i+1}"
             continue
-        Ton, Tp, Tend = float(T[left]), float(T[p]), float(T[right])
-        mass_loss = float(mass_pct[left] - mass_pct[right])
-        if mass_loss < 0:
-            # Skip pathological cases
-            continue
-        events.append(Event(left, int(p), right, Ton, Tp, Tend, mass_loss))
-    return events
+        base = cand
+        k = 1
+        while used.get(cand, False):
+            k += 1
+            cand = f"{base}_{k}"
+        used[cand] = True
+        out[i] = cand
 
-# ------------------------------- Sidebar --------------------------------- #
-st.sidebar.header("Entrada de dados")
-files = st.sidebar.file_uploader("Arquivos CSV (1 ou mais)", type=["csv", "txt"], accept_multiple_files=True)
-if not files:
-    st.info("Envie pelo menos 1 CSV contendo colunas de Temperatura e Massa.")
-    st.stop()
+    return out
 
-st.sidebar.subheader("Mapeamento de colunas")
-col_T = st.sidebar.text_input("Coluna de Temperatura", value="temperature")
-col_m = st.sidebar.text_input("Coluna de Massa", value="mass")
-assume_percent = st.sidebar.checkbox("Massa já em %", value=False, help="Desmarque se a massa estiver em mg ou unidades absolutas.")
-normalize_start = st.sidebar.checkbox("Normalizar massa inicial para 100%", value=True)
+# --------------------------
+# UI
+# --------------------------
+uploaded = st.file_uploader("Envie o arquivo .txt", type=["txt"])
 
-st.sidebar.subheader("Pré-processamento & Derivada")
-use_drift_corr = st.sidebar.checkbox("Correção linear de drift (pré/pós)", value=True)
-n_head = st.sidebar.number_input("Pontos no início (baseline)", value=50, min_value=5, step=5)
-n_tail = st.sidebar.number_input("Pontos no fim (baseline)", value=50, min_value=5, step=5)
-
-use_savgol = st.sidebar.checkbox("Savitzky–Golay (suavizar/derivar)", value=True)
-sg_window = st.sidebar.slider("Janela SG (pontos, ímpar)", 5, 201, 21, step=2)
-sg_poly = st.sidebar.slider("Ordem do polinômio SG", 2, 5, 3)
-
-st.sidebar.subheader("Detecção de eventos (DTG)")
-prom = st.sidebar.number_input("Proeminência mínima (-DTG)", value=0.05, step=0.01, help="Em pontos percentuais por °C (pp/°C)")
-width_pts = st.sidebar.number_input("Largura mínima (pontos)", value=10, step=1)
-frac_height = st.sidebar.slider("Limite de janela (% do pico)", 1, 60, 10) / 100.0
-
-st.sidebar.subheader("Outros")
-T_min_global = st.sidebar.number_input("Temperatura mínima para plot", value=0.0, step=10.0)
-T_max_global = st.sidebar.number_input("Temperatura máxima para plot", value=800.0, step=10.0)
-
-# ------------------------------- Main UI --------------------------------- #
-st.title("🔥 TGA com DTG, Filtro de Ruído e Eventos Térmicos")
-st.caption("Sobrepõe curvas, calcula DTG, identifica eventos automaticamente e estima perdas de massa por etapa.")
-
-fig_tga = go.Figure()
-fig_dtg = go.Figure()
-
-summary_rows: List[Dict] = []
-processed_concat = []
-results: List[SampleResult] = []
-
-for f in files:
-    name = f.name
-    # Try both decimal separators
-    try:
-        raw = robust_read_csv(f, decimal='.')
-    except Exception:
-        f.seek(0)
-        raw = robust_read_csv(f, decimal=',')
-
-    if col_T not in raw.columns or col_m not in raw.columns:
-        st.warning(f"{name}: não encontrei colunas '{col_T}' e '{col_m}'.")
-        continue
-
-    df = raw[[col_T, col_m]].dropna().astype(float)
-    df.columns = ['T', 'm']
-    df = df.sort_values('T')
-
-    # Normalize mass to %
-    m_pct = normalize_mass(df['m'].to_numpy(), assume_percent=assume_percent, normalize_start=normalize_start)
-
-    # Drift correction (optional)
-    if use_drift_corr:
-        m_pct = linear_drift_correction(df['T'].to_numpy(), m_pct, int(n_head), int(n_tail))
-
-    # Smooth + DTG
-    m_sm, dtg = compute_dtg(df['T'].to_numpy(), m_pct, int(sg_window), int(sg_poly), deriv_smooth=use_savgol)
-
-    # Event detection
-    events = detect_events(df['T'].to_numpy(), dtg, m_sm, prominence=float(prom), width_pts=int(width_pts), frac_height=float(frac_height))
-
-    # Residue at max temperature
-    mask_window = (df['T'] >= T_min_global) & (df['T'] <= T_max_global)
-    T_win = df['T'].to_numpy()[mask_window]
-    m_win = m_sm[mask_window]
-    residue = float(m_win[-1]) if len(m_win) > 0 else float(m_sm[-1])
-
-    results.append(SampleResult(name=name, residue_pct=residue, events=events))
-
-    # Plot TGA
-    fig_tga.add_trace(go.Scatter(x=df['T'], y=m_sm, mode='lines', name=f"{name} – m%", line=dict(width=2)))
-
-    # Shade event windows and annotate mass loss
-    for k, ev in enumerate(events, start=1):
-        fig_tga.add_vrect(x0=ev.Tonset, x1=ev.Tend, fillcolor='LightCoral', opacity=0.15, line_width=0,
-                          annotation_text=f"E{k}: -{ev.mass_loss_pct:.1f}% @ {ev.Tpeak:.0f}°C", annotation_position='top left')
-
-    # Plot DTG
-    fig_dtg.add_trace(go.Scatter(x=df['T'], y=dtg, mode='lines', name=f"{name} – DTG", line=dict(width=2)))
-    for ev in events:
-        fig_dtg.add_vline(x=ev.Tpeak, line=dict(dash='dot', width=1))
-
-    # Summary rows
-    if events:
-        cum_loss = sum([ev.mass_loss_pct for ev in events])
-    else:
-        cum_loss = 0.0
-    summary_rows.append({
-        'Amostra': name,
-        'Eventos': len(events),
-        'Perda total (%)': cum_loss,
-        'Resíduo final (%)': residue,
-    })
-
-    # Processed export
-    processed_concat.append(pd.DataFrame({
-        'sample': name,
-        'T_C': df['T'].to_numpy(),
-        'mass_pct': m_sm,
-        'DTG_pp_per_C': dtg,
-    }))
-
-# Layout & axes
-fig_tga.update_layout(template='plotly_dark', height=520, xaxis_title='Temperatura (°C)', yaxis_title='Massa (%)', legend_title='Amostras')
-fig_tga.update_xaxes(range=[T_min_global, T_max_global])
-
-fig_dtg.update_layout(template='plotly_dark', height=420, xaxis_title='Temperatura (°C)', yaxis_title='DTG (pp/°C)', legend_title='Amostras')
-fig_dtg.update_xaxes(range=[T_min_global, T_max_global])
-
-st.plotly_chart(fig_tga, use_container_width=True)
-st.plotly_chart(fig_dtg, use_container_width=True)
-
-# ------------------------------- Tables & Export -------------------------- #
-# Events table (long format)
-rows = []
-for r in results:
-    for i, ev in enumerate(r.events, start=1):
-        rows.append({
-            'Amostra': r.name,
-            'Evento': i,
-            'Tonset (°C)': ev.Tonset,
-            'Tpeak (°C)': ev.Tpeak,
-            'Tend (°C)': ev.Tend,
-            'Perda de massa (%)': ev.mass_loss_pct,
-        })
-
-if rows:
-    st.subheader("Eventos detectados")
-    df_events = pd.DataFrame(rows)
-    st.dataframe(df_events, use_container_width=True)
-
-if summary_rows:
-    st.subheader("Resumo por amostra")
-    df_summary = pd.DataFrame(summary_rows)
-    st.dataframe(df_summary, use_container_width=True)
-
-# Downloads
-if processed_concat:
-    comb = pd.concat(processed_concat, ignore_index=True)
-    buf = io.StringIO(); comb.to_csv(buf, index=False)
-    st.download_button("⬇️ Baixar curvas processadas (CSV)", buf.getvalue(), file_name="tga_processed_curves.csv", mime="text/csv")
-
-if rows:
-    evbuf = io.StringIO(); pd.DataFrame(rows).to_csv(evbuf, index=False)
-    st.download_button("⬇️ Baixar eventos (CSV)", evbuf.getvalue(), file_name="tga_events.csv", mime="text/csv")
-
-if summary_rows:
-    sumbuf = io.StringIO(); pd.DataFrame(summary_rows).to_csv(sumbuf, index=False)
-    st.download_button("⬇️ Baixar resumo (CSV)", sumbuf.getvalue(), file_name="tga_summary.csv", mime="text/csv")
-
-# ------------------------------- Help Box -------------------------------- #
-with st.expander("Notas & Boas Práticas"):
-    st.markdown(
-        """
-        **Entrada**
-        - CSV com colunas de `temperature` (°C) e `mass` (mg ou %). Mapeie os nomes nas opções.
-        - Se a massa não estiver em %, o app normaliza a massa inicial para 100%.
-
-        **Pré-processamento**
-        - *Correção linear de drift*: ajusta uma linha usando os primeiros/últimos pontos e subtrai do sinal (útil para flutuações de empuxo).
-        - *Savitzky–Golay*: define janela (ímpar) e ordem do polinômio; a derivada DTG pode ser calculada com smoothing.
-
-        **Eventos (DTG)**
-        - Os eventos são identificados como picos negativos em DTG; use `proeminência` e `largura` para controlar a detecção.
-        - As janelas de evento são definidas onde `-DTG` cai abaixo de uma fração da altura do pico. A perda de massa é `m(Tonset) − m(Tend)`.
-
-        **Saídas**
-        - Tabelas com *Tonset, Tpeak, Tend, perda de massa* e *resíduo final*.
-        - Exporte CSVs com curvas processadas, eventos e resumo.
-        """
+c1, c2 = st.columns(2)
+with c1:
+    custom_marker = st.text_input("Marcador antes da tabela (opcional)", value="[step]")
+with c2:
+    output_sep_label = st.selectbox(
+        "Delimitador de saída",
+        ["Tab (\\t)", "Vírgula (,)", "Ponto e vírgula (;)", "Espaço ( )"],
+        index=0,
     )
+
+sep_map = {
+    "Tab (\\t)": "\t",
+    "Vírgula (,)": ",",
+    "Ponto e vírgula (;)": ";",
+    "Espaço ( )": " ",
+}
+
+include_header = st.checkbox("Incluir linha de cabeçalho na saída", value=True)
+decimal_to_dot = st.checkbox("Trocar vírgula por ponto nos decimais", value=False)
+manual_skip = st.number_input("Ignorar N linhas manualmente (opcional)", min_value=0, value=0, step=1)
+
+st.divider()
+st.subheader("Padronização de cabeçalho")
+auto_standardize = st.checkbox("Padronizar automaticamente para time / temperature / mass / mass_pct", value=True)
+allow_manual_override = st.checkbox("Permitir sobrescrever via seleção manual", value=True)
+
+if uploaded:
+    raw = uploaded.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1", errors="replace")
+
+    lines_all = text.splitlines()
+
+    # recorte por skip/manual
+    if manual_skip > 0:
+        lines = lines_all[int(manual_skip):]
+    else:
+        lines = lines_all
+
+    # recorte por marcador
+    if custom_marker and custom_marker.strip():
+        lower_marker = custom_marker.lower()
+        for i, ln in enumerate(lines):
+            if lower_marker in ln.lower():
+                lines = lines[i:]
+                break
+
+    h_idx, u_idx, d_idx = find_table_start(lines)
+
+    if d_idx is None:
+        st.error("Não consegui encontrar automaticamente o início da tabela. "
+                 "Tente informar o 'Marcador antes da tabela' ou usar 'Ignorar N linhas'.")
+    else:
+        col_names, units_line, rows = build_dataframe_like(lines, h_idx, u_idx, d_idx)
+        if not rows:
+            st.warning("Tabela detectada, mas sem linhas válidas. Ajuste o marcador ou 'Ignorar N linhas'.")
+        else:
+            st.success(f"Tabela detectada! Colunas originais: {len(col_names)} • Linhas (preview): {min(len(rows), 50)}")
+
+            # 1) Padronização automática
+            std_cols = col_names[:]
+            if auto_standardize:
+                std_cols = standardize_header(col_names, units=units_line, sample_rows=rows[:3])
+
+            # 2) Sobrescrita manual (opcional)
+            final_cols = std_cols[:]
+            if allow_manual_override:
+                st.caption("Se necessário, selecione quais colunas correspondem a cada papel:")
+                opts = [f"{i+1}: {col_names[i]} → {std_cols[i]}" for i in range(len(col_names))]
+                def idx_from_opt(opt):
+                    return int(opt.split(":")[0]) - 1
+
+                time_choice = st.selectbox("Coluna para `time`", ["(não alterar)"] + opts, index=0)
+                temp_choice = st.selectbox("Coluna para `temperature`", ["(não alterar)"] + opts, index=0)
+                mass_choice = st.selectbox("Coluna para `mass`", ["(não alterar)"] + opts, index=0)
+                masspct_choice = st.selectbox("Coluna para `mass_pct`", ["(não alterar)"] + opts, index=0)
+
+                # aplica sobrescritas
+                chosen = {
+                    "time": time_choice,
+                    "temperature": temp_choice,
+                    "mass": mass_choice,
+                    "mass_pct": masspct_choice,
+                }
+                for role, choice in chosen.items():
+                    if choice != "(não alterar)":
+                        j = idx_from_opt(choice)
+                        final_cols[j] = role
+
+            # Preview
+            preview_txt = make_txt(final_cols, rows[:50], sep="\t", include_header=True, decimal_to_dot=decimal_to_dot)
+            st.text_area("Prévia (primeiras linhas)", preview_txt, height=240)
+
+            # Exporta
+            out_txt = make_txt(final_cols, rows, sep=sep_map[output_sep_label],
+                               include_header=include_header, decimal_to_dot=decimal_to_dot)
+            base_name = os.path.splitext(uploaded.name)[0]
+            out_name = f"{base_name}_limpo.txt"
+            st.download_button("⬇️ Baixar TXT limpo (padronizado)", data=out_txt.encode("utf-8"),
+                               file_name=out_name, mime="text/plain")
+
+st.caption("Dica: se vierem duas colunas 'Weight', a primeira tende a ser massa absoluta (`mass`) e a segunda massa percentual (`mass_pct`).")
+
