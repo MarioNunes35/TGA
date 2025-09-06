@@ -1,9 +1,11 @@
-# streamlit_tga_dtg_events.py (fixed)
+# streamlit_tga_dtg_events.py (completo com suavização)
 import io
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+from scipy import ndimage
+from scipy.signal import savgol_filter
 
 # Plotly optional
 PLOTLY_OK = True
@@ -126,6 +128,57 @@ def _normalize_and_automap(df: pd.DataFrame):
 
     return df, guess
 
+def apply_smoothing(data, method="none", window=5, sigma=1.0, polyorder=3):
+    """
+    Aplica suavização aos dados.
+    
+    Métodos disponíveis:
+    - "none": sem suavização
+    - "moving_average": média móvel
+    - "gaussian": filtro gaussiano
+    - "savgol": filtro Savitzky-Golay
+    """
+    if method == "none" or len(data) < 3:
+        return data
+    
+    # Remove NaN values for smoothing
+    mask = ~np.isnan(data)
+    if np.sum(mask) < 3:
+        return data
+    
+    smoothed = data.copy()
+    valid_data = data[mask]
+    
+    try:
+        if method == "moving_average":
+            if window >= len(valid_data):
+                window = max(3, len(valid_data) // 3)
+            smoothed_valid = pd.Series(valid_data).rolling(window=window, center=True).mean()
+            smoothed_valid = smoothed_valid.fillna(method='bfill').fillna(method='ffill')
+            smoothed[mask] = smoothed_valid
+            
+        elif method == "gaussian":
+            if sigma <= 0:
+                sigma = 1.0
+            smoothed_valid = ndimage.gaussian_filter1d(valid_data, sigma=sigma)
+            smoothed[mask] = smoothed_valid
+            
+        elif method == "savgol":
+            if window >= len(valid_data):
+                window = max(5, len(valid_data) // 3)
+            if window % 2 == 0:  # window deve ser ímpar
+                window += 1
+            if polyorder >= window:
+                polyorder = max(1, window - 2)
+            smoothed_valid = savgol_filter(valid_data, window, polyorder)
+            smoothed[mask] = smoothed_valid
+            
+    except Exception as e:
+        st.warning(f"Erro na suavização ({method}): {e}. Usando dados originais.")
+        return data
+        
+    return smoothed
+
 def apply_plotly_layout(fig, title_text, ytitle, title_size, label_size, tick_size, legend_size):
     # Safely get font sizes
     safe_title_size = _safe_font_size(title_size, 16)
@@ -206,7 +259,8 @@ def robust_read_to_df(content_bytes: bytes, decimal_hint: str = "."):
     return df, {}, header_row, sep_used
 
 # ------------------------ Processamento ------------------------
-def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "first"):
+def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "first", 
+                  smooth_method="none", smooth_window=5, smooth_sigma=1.0, smooth_polyorder=3):
     t_col = mapping["temperature"]
     T = pd.to_numeric(df_raw[t_col].astype(str).str.replace(",", "."), errors="coerce")
 
@@ -231,14 +285,22 @@ def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "fi
     if mpct is None:
         raise ValueError("Coluna de massa/porcentagem não encontrada. Ajuste o mapeamento.")
 
+    # Aplicar suavização se solicitado
+    if smooth_method != "none":
+        T_smooth = apply_smoothing(T.values, smooth_method, smooth_window, smooth_sigma, smooth_polyorder)
+        mpct_smooth = apply_smoothing(mpct.values, smooth_method, smooth_window, smooth_sigma, smooth_polyorder)
+    else:
+        T_smooth = T.values
+        mpct_smooth = mpct.values
+
     with np.errstate(invalid="ignore", divide="ignore"):
-        dt = np.gradient(T)
-        dM = np.gradient(mpct)
+        dt = np.gradient(T_smooth)
+        dM = np.gradient(mpct_smooth)
         dtg = -dM / dt
 
     out = pd.DataFrame({
-        "Temperature": T,
-        "Mass_pct": mpct,
+        "Temperature": T_smooth,
+        "Mass_pct": mpct_smooth,
         "DTG_(-%/°C)": dtg
     })
     out = out.dropna(subset=["Temperature", "Mass_pct"])
@@ -251,6 +313,33 @@ with st.sidebar:
     st.header("Preferências")
     decimal_hint = st.selectbox("Separador decimal nos arquivos", [".", ","], index=0)
     baseline_mode = st.radio("Se só houver Massa, calcular % usando:", ["first", "max"], index=0)
+
+    st.markdown("---")
+    st.subheader("Suavização de Dados")
+    smooth_method = st.selectbox(
+        "Método de suavização", 
+        ["none", "moving_average", "gaussian", "savgol"], 
+        index=0,
+        help="Suavização reduz ruído, especialmente importante para DTG"
+    )
+    
+    if smooth_method != "none":
+        if smooth_method == "moving_average":
+            smooth_window = st.slider("Janela (média móvel)", 3, 21, 5, step=2)
+            smooth_sigma = 1.0
+            smooth_polyorder = 3
+        elif smooth_method == "gaussian":
+            smooth_sigma = st.slider("Sigma (gaussiano)", 0.5, 5.0, 1.0, step=0.1)
+            smooth_window = 5
+            smooth_polyorder = 3
+        elif smooth_method == "savgol":
+            smooth_window = st.slider("Janela (Savitzky-Golay)", 5, 21, 7, step=2)
+            smooth_polyorder = st.slider("Ordem polinomial", 2, min(6, smooth_window-1), 3)
+            smooth_sigma = 1.0
+    else:
+        smooth_window = 5
+        smooth_sigma = 1.0
+        smooth_polyorder = 3
 
     st.markdown("---")
     st.subheader("Estilo dos gráficos")
