@@ -1,34 +1,31 @@
-# streamlit_tga_plotter.py
-# -*- coding: utf-8 -*-
-"""
-TGA/DTG Plotter (TXT/CSV)
-- Múltiplos arquivos
-- Detecção de separador e vírgula decimal
-- Mapeamento automático + ajuste manual
-- Suavização (média móvel / Savitzky–Golay)
-- Correção de drift (linear) [opcional]
-- Corte de início (por T e/ou N pontos)
-- Alinhamento em Y (alvo para 1º ponto + offset)
-- Estilo por série (cor, espessura, rótulo, incluir)
-- Ajustes globais (fontes, faixas X/Y)
-- Presets 1‑clique para faixas (auto/quantis/0–100/Reset) com st.session_state seguro
-- Visualização: Plotly (interativo) ou Matplotlib (publicação)
-- Exportação alta resolução (PNG com DPI e SVG vetorial)
-"""
-
-from __future__ import annotations
+# streamlit_tga_dtg_events.py
+# ------------------------------------------------------------
+# App TGA/DTG com mapeamento de colunas e gráficos robustos
+# ------------------------------------------------------------
 
 import io
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --- Safe casting helpers to avoid ValueError when inputs are blank/None ---
+# Plotly (opcional; se não houver, cai para Matplotlib)
+PLOTLY_OK = True
+try:
+    import plotly.graph_objects as go
+except Exception:
+    PLOTLY_OK = False
+
+# Matplotlib fallback
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="TGA/DTG Viewer", layout="wide")
+
+
+# ------------------------ Helpers robustos ------------------------
+
 def _coerce_float(val, default=None):
+    """Converte para float com segurança (None ou '' -> default)."""
     try:
         if val is None:
             return default
@@ -38,7 +35,9 @@ def _coerce_float(val, default=None):
     except Exception:
         return default
 
+
 def _coerce_int(val, default=None):
+    """Converte para int com segurança (None ou '' -> default)."""
     try:
         if val is None:
             return default
@@ -48,592 +47,405 @@ def _coerce_int(val, default=None):
     except Exception:
         return default
 
-# SciPy (opcional)
-try:
-    from scipy.signal import savgol_filter
-    SCIPY_OK = True
-except Exception:
-    savgol_filter = None
-    SCIPY_OK = False
 
-# Matplotlib
-import matplotlib.pyplot as plt
-
-# Plotly (interativo)
-try:
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
-except Exception:
-    go = None
-    PLOTLY_OK = False
-
-# --------------------- Leitura e Padronização ---------------------
-
-KNOWN_HEADER_TOKENS = {
-    "time", "t", "tempo",
-    "temp", "temperature", "temperatura",
-    "weight", "weight%", "mass", "massa", "mass%", "mass_pct"
-}
-SEPARATORS = [r"\\s+", "\\t", ";", ","]
-
-
-def has_decimal_comma(text: str) -> bool:
-    return bool(re.search(r"\\d+,\\d+", text))
-
-
-def find_header_row(text: str) -> int:
-    lines = text.splitlines()
-    max_check = min(len(lines), 200)
-    for i in range(max_check):
-        tokens = re.split(r"[;\\t, ]+", lines[i].strip())
-        tokens_lc = {t.lower() for t in tokens if t}
-        if tokens_lc & KNOWN_HEADER_TOKENS and len(tokens_lc) >= 2:
-            return i
-    return 0
-
-
-def try_read_with_sep(text: str, header_row: int, sep: str, decimal: str) -> Optional[pd.DataFrame]:
-    try:
-        return pd.read_csv(
-            io.StringIO(text),
-            sep=sep,
-            engine="python",
-            header=0,
-            skiprows=header_row,
-            decimal=decimal
-        )
-    except Exception:
-        return None
-
-
-def dedupe_columns(cols: List[str]) -> List[str]:
-    counts: Dict[str, int] = {}
-    new_cols: List[str] = []
+def _normalize_and_automap(df: pd.DataFrame):
+    """
+    1) Deduplica nomes de colunas preservando ordem (ex.: Weight -> Weight_1, ...)
+    2) Tenta automapear temperatura e massa/massa% quando possível (duas 'Weight').
+    Retorna (df_normalizado, mapping_guess_parcial)
+    """
+    cols = [str(c).strip() for c in df.columns]
+    seen, new_cols = {}, []
     for c in cols:
-        c = str(c).strip()
-        counts[c] = counts.get(c, 0) + 1
-        new_cols.append(f"{c}_{counts[c]}" if counts[c] > 1 else c)
-    return new_cols
-
-
-def robust_read_to_df(file_bytes: bytes, decimal_hint: Optional[str] = None) -> Tuple[pd.DataFrame, Dict[str, str], int, str]:
-    text = file_bytes.decode("utf-8", errors="replace")
-    header_row = find_header_row(text)
-    decimal = decimal_hint or ("," if has_decimal_comma(text) else ".")
-
-    for sep in SEPARATORS:
-        df = try_read_with_sep(text, header_row, sep, decimal)
-        if df is None or df.empty:
-            continue
-        df.columns = dedupe_columns(list(df.columns))
-        mapping = auto_map_columns(df)
-        return df, mapping, header_row, sep
-
-    # fallback: largura fixa
-    df = pd.read_fwf(io.StringIO("\\n".join(text.splitlines()[header_row:])), header=0)
-    df.columns = dedupe_columns(list(df.columns))
-    mapping = auto_map_columns(df)
-    return df, mapping, header_row, "fwf"
-
-
-def auto_map_columns(df: pd.DataFrame) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for c in df.columns:
-        lc = c.lower().strip()
-        if lc.startswith("temp"):
-            out.setdefault("temperature", c)
-        elif lc.startswith("time") or lc in {"t", "tempo"}:
-            out.setdefault("time", c)
-        elif lc.startswith("mass") or lc.startswith("massa") or lc.startswith("weight"):
-            pass
-
-    weight_like = [c for c in df.columns if c not in out.values()
-                   and (c.lower().startswith("mass") or c.lower().startswith("massa") or c.lower().startswith("weight"))]
-
-    perc_col = None
-    gram_col = None
-    for c in weight_like:
-        v = pd.to_numeric(df[c], errors="coerce").dropna()
-        if v.empty:
-            continue
-        if (v.max() > 50) or (len(v) > 0 and v.iloc[0] >= 50):
-            perc_col = perc_col or c
+        if c in seen:
+            seen[c] += 1
+            new_cols.append(f"{c}_{seen[c]}")
         else:
-            gram_col = gram_col or c
+            seen[c] = 0
+            new_cols.append(c)
+    df.columns = new_cols
 
-    if gram_col:
-        out["mass"] = gram_col
-    if perc_col:
-        out["mass_pct"] = perc_col
-    return out
+    guess = {}
 
+    # Temperatura (heurística simples)
+    for cand in ["Temperature", "Temp", "T", "temperatura", "Temperature (°C)"]:
+        if cand in df.columns:
+            guess["temperature"] = cand
+            break
 
-# --------------------- Processamento ---------------------
+    # Se existirem duas "Weight", decidir qual é massa (%) e qual é massa absoluta
+    wcols = [c for c in df.columns if c.lower() == "weight" or c.lower().startswith("weight_")]
+    if len(wcols) >= 2:
+        c1, c2 = wcols[:2]
 
-@dataclass
-class TGAOptions:
-    assume_percent: bool = False
-    normalize_start: bool = True
-    smoothing: str = "Nenhum"  # Nenhum | MediaMovel | Savitzky-Golay
-    ma_window: int = 11
-    sg_window: int = 21
-    sg_poly: int = 3
+        def first_float(col):
+            try:
+                return float(str(df[col].dropna().iloc[0]).replace(",", "."))
+            except Exception:
+                return None
 
-@dataclass
-class TrimAlignOptions:
-    cut_Tmin: Optional[float] = None
-    cut_Nfirst: int = 0
-    y_target_start: Optional[float] = 100.0  # re-escala 1º ponto para alvo (None desativa)
-    y_offset: float = 0.0  # offset aditivo em m%
+        v1, v2 = first_float(c1), first_float(c2)
 
-
-def to_percent_mass(mass: np.ndarray, assume_percent: bool, normalize_start: bool) -> np.ndarray:
-    m = mass.astype(float)
-    if not assume_percent:
-        m = (m / max(m[0], 1e-12)) * 100.0
-    elif normalize_start:
-        m = (m / max(m[0], 1e-12)) * 100.0
-    return m
-
-
-def smooth_signal(y: np.ndarray, opts: TGAOptions, deriv: bool = False, x: Optional[np.ndarray] = None) -> np.ndarray:
-    if opts.smoothing == "Nenhum":
-        if deriv:
-            if x is None:
-                x = np.arange(len(y))
-            return np.gradient(y, x)
-        return y
-    elif opts.smoothing == "MediaMovel":
-        w = max(3, int(opts.ma_window) | 1)  # ímpar
-        pad = w // 2
-        ypad = np.pad(y, (pad, pad), mode="edge")
-        c = np.ones(w) / w
-        ys = np.convolve(ypad, c, mode="valid")
-        if deriv:
-            if x is None:
-                x = np.arange(len(ys))
-            return np.gradient(ys, x)
-        return ys
-    elif opts.smoothing == "Savitzky-Golay":
-        if not SCIPY_OK:
-            return smooth_signal(y, TGAOptions(**{**opts.__dict__, "smoothing": "MediaMovel"}), deriv, x)
-        w = max(5, int(opts.sg_window) | 1)
-        p = max(2, int(opts.sg_poly))
-        if deriv:
-            if x is None:
-                x = np.arange(len(y))
-            dx = np.mean(np.diff(x))
-            if dx <= 0:
-                dx = 1.0
-            return savgol_filter(y, window_length=w, polyorder=p, deriv=1, delta=dx, mode="interp")
+        if v1 is not None and v2 is not None:
+            if v1 > 50 and v2 < 50:
+                pct, mass = c1, c2
+            elif v2 > 50 and v1 < 50:
+                pct, mass = c2, c1
+            else:
+                # fallback: coluna com maior máximo costuma ser % (inicia perto de 100)
+                pct, mass = (c1, c2) if pd.to_numeric(df[c1], errors="coerce").max() >= pd.to_numeric(df[c2], errors="coerce").max() else (c2, c1)
         else:
-            return savgol_filter(y, window_length=w, polyorder=p, mode="interp")
-    return y
+            pct, mass = c1, c2
+
+        df.rename(columns={mass: "Mass", pct: "Mass_pct"}, inplace=True)
+        guess["mass"] = "Mass"
+        guess["mass_pct"] = "Mass_pct"
+    else:
+        # tentativas simples
+        for cand in ["Mass", "Weight", "Massa", "mass (mg)", "mass (g)"]:
+            if cand in df.columns:
+                guess["mass"] = cand
+                break
+        for cand in ["Mass_pct", "Mass %", "Massa %", "Weight %", "mass%"]:
+            if cand in df.columns:
+                guess["mass_pct"] = cand
+                break
+
+    return df, guess
 
 
-def process_single(df: pd.DataFrame, mapping: Dict[str, str], tga_opts: TGAOptions, trim_opts: TrimAlignOptions) -> pd.DataFrame:
-    if "temperature" not in mapping:
-        raise ValueError("Coluna de temperatura não encontrada. Ajuste o mapeamento.")
-    if "mass" not in mapping and "mass_pct" not in mapping:
+def apply_plotly_layout(fig, title_text, ytitle, title_size, label_size, tick_size, legend_size):
+    """
+    Aplica layout de modo robusto ao Plotly (sem ValueError quando inputs estão vazios).
+    """
+    layout = dict(
+        template="plotly_white",
+        xaxis_title="Temperatura (°C)",
+        yaxis_title=ytitle,
+        title_text=title_text,
+        title_font_size=_coerce_int(title_size, 16),
+    )
+    xaxis = dict(
+        tickfont=dict(size=_coerce_int(tick_size, 12)),
+        titlefont=dict(size=_coerce_int(label_size, 14)),
+    )
+    yaxis = dict(
+        tickfont=dict(size=_coerce_int(tick_size, 12)),
+        titlefont=dict(size=_coerce_int(label_size, 14)),
+    )
+    x_min = _coerce_float(st.session_state.get("x_min"))
+    x_max = _coerce_float(st.session_state.get("x_max"))
+    y_min = _coerce_float(st.session_state.get("y_min"))
+    y_max = _coerce_float(st.session_state.get("y_max"))
+    if x_min is not None and x_max is not None:
+        xaxis["range"] = [x_min, x_max]
+    if y_min is not None and y_max is not None:
+        yaxis["range"] = [y_min, y_max]
+    layout["xaxis"] = xaxis
+    layout["yaxis"] = yaxis
+
+    leg = _coerce_int(legend_size, None)
+    if leg is not None:
+        layout["legend"] = dict(font=dict(size=leg))
+
+    fig.update_layout(**layout)
+
+
+# ------------------------ Leitura robusta ------------------------
+
+def robust_read_to_df(content_bytes: bytes, decimal_hint: str = "."):
+    """
+    Lê TXT/CSV com separação por espaços múltiplos (\\s+) ou vírgulas/pontos-e-vírgulas.
+    Retorna: df, mapping_guess (vazio aqui), header_row(0), sep_used(str)
+    """
+    text = content_bytes.decode("utf-8", errors="replace")
+    decimal = "," if decimal_hint == "," else "."
+    sep_used = r"\s+"
+    header_row = 0
+
+    # Tentativa 1: whitespace (mais comum em exportações de TGA)
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=r"\s+", engine="python", decimal=decimal)
+        return df, {}, header_row, sep_used
+    except Exception:
+        pass
+
+    # Tentativa 2: vírgula
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=",", engine="python", decimal=decimal)
+        sep_used = ","
+        return df, {}, header_row, sep_used
+    except Exception:
+        pass
+
+    # Tentativa 3: ponto-e-vírgula
+    df = pd.read_csv(io.StringIO(text), sep=";", engine="python", decimal=decimal)
+    sep_used = ";"
+    return df, {}, header_row, sep_used
+
+
+# ------------------------ Processamento de um arquivo ------------------------
+
+def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "first"):
+    """
+    Normaliza e retorna DataFrame processado com colunas:
+      - Temperature (float)
+      - Mass_pct (float)
+      - DTG_(-%/°C) (float)  -> derivada negativa de Mass_pct vs Temperature
+    """
+    # Coluna de temperatura
+    t_col = mapping["temperature"]
+    T = pd.to_numeric(df_raw[t_col].astype(str).str.replace(",", "."), errors="coerce")
+
+    # Massa % preferencialmente; senão, calcular a partir da massa absoluta
+    mpct = None
+    if "mass_pct" in mapping:
+        mcol = mapping["mass_pct"]
+        if mcol in df_raw.columns:
+            mpct = pd.to_numeric(df_raw[mcol].astype(str).str.replace(",", "."), errors="coerce")
+
+    if mpct is None and "mass" in mapping and mapping["mass"] in df_raw.columns:
+        mabs = pd.to_numeric(df_raw[mapping["mass"]].astype(str).str.replace(",", "."), errors="coerce")
+        if baseline_mode == "first":
+            base = mabs.dropna().iloc[0] if len(mabs.dropna()) else np.nan
+        else:
+            base = np.nanmax(mabs.values)
+        mpct = (mabs / base) * 100.0 if base and base != 0 else np.nan
+
+    # Se ainda assim não houver Mass_pct, aborta
+    if mpct is None:
         raise ValueError("Coluna de massa/porcentagem não encontrada. Ajuste o mapeamento.")
 
-    T = pd.to_numeric(df[mapping["temperature"]], errors="coerce").to_numpy()
-
-    if "mass" in mapping:
-        m_raw = pd.to_numeric(df[mapping["mass"]], errors="coerce").to_numpy()
-        m_pct = to_percent_mass(m_raw, tga_opts.assume_percent, tga_opts.normalize_start)
-    else:
-        m_pct = pd.to_numeric(df[mapping["mass_pct"]], errors="coerce").to_numpy()
-        if tga_opts.normalize_start:
-            m_pct = (m_pct / max(m_pct[0], 1e-12)) * 100.0
-
-    # --- Corte inicial ---
-    mask = np.ones_like(T, dtype=bool)
-    if trim_opts.cut_Tmin is not None:
-        mask &= (T >= float(trim_opts.cut_Tmin))
-    if trim_opts.cut_Nfirst > 0:
-        idxs = np.where(mask)[0]
-        if len(idxs) > trim_opts.cut_Nfirst:
-            mask[idxs[:trim_opts.cut_Nfirst]] = False
-    T = T[mask]
-    m_pct = m_pct[mask]
-
-    # --- Suavização e DTG ---
-    m_pct_s = smooth_signal(m_pct, tga_opts, deriv=False, x=T)
-    dtg = -smooth_signal(m_pct_s, tga_opts, deriv=True, x=T)
-
-    # --- Ajuste do início em Y ---
-    if trim_opts.y_target_start is not None and len(m_pct_s) > 0:
-        current = m_pct_s[0]
-        if abs(current) > 1e-12:
-            scale = (float(trim_opts.y_target_start) / current)
-            m_pct_s = m_pct_s * scale
-            dtg = dtg * scale
-    if abs(trim_opts.y_offset) > 0:
-        m_pct_s = m_pct_s + float(trim_opts.y_offset)
+    # Cálculo do DTG: - d(M%)/dT
+    # Usamos gradient com T (em °C)
+    with np.errstate(invalid="ignore"):
+        dt = np.gradient(T)
+        dM = np.gradient(mpct)
+        dtg = -dM / dt
 
     out = pd.DataFrame({
         "Temperature": T,
-        "Mass_pct": m_pct_s,
+        "Mass_pct": mpct,
         "DTG_(-%/°C)": dtg
     })
-    return out.dropna()
+    out = out.dropna(subset=["Temperature", "Mass_pct"])  # T e M% são essenciais
+    return out
 
 
-# --- Helper para auto-range seguro ---
-def _queue_ranges(xmin=None, xmax=None, ymin=None, ymax=None):
-    st.session_state["_pending_ranges"] = {"x_min": xmin, "x_max": xmax, "y_min": ymin, "y_max": ymax}
+# ------------------------ UI ------------------------
 
-
-# --------------------- UI ---------------------
-
-st.set_page_config(page_title="TGA/DTG Plotter", layout="wide")
-st.title("📈 TGA/DTG Plotter (TXT/CSV) — v3")
-
-st.markdown(
-    """
-Envie arquivos de TGA (TXT/CSV) com **Temperatura** e **Massa** (ou **Massa %**).
-Mapeie colunas, corte o início em X/Y, ajuste estilo e exporte em alta resolução.
-"""
-)
+st.title("TGA / DTG — Leitor e Plotador")
 
 with st.sidebar:
-    st.header("Importação")
-    dec_choice = st.selectbox("Separador decimal", ["Auto", ".", ","], index=0)
-    decimal_hint = None if dec_choice == "Auto" else dec_choice
+    st.header("Preferências")
+    decimal_hint = st.selectbox("Separador decimal nos arquivos", [".", ","], index=0)
+    baseline_mode = st.radio("Se só houver Massa, calcular % usando:", ["first", "max"], index=0)
 
-    st.header("Pré-processamento")
-    assume_percent = st.checkbox("Massa já em %", value=False)
-    normalize_start = st.checkbox("Normalizar para 100% no início (antes do corte)", value=True)
+    st.markdown("---")
+    st.subheader("Estilo dos gráficos")
+    title_size = st.number_input("Tamanho do título", min_value=6, max_value=48, value=16, step=1)
+    label_size = st.number_input("Tamanho dos rótulos dos eixos", min_value=6, max_value=36, value=14, step=1)
+    tick_size = st.number_input("Tamanho dos ticks", min_value=6, max_value=28, value=12, step=1)
+    legend_size = st.number_input("Tamanho da legenda", min_value=6, max_value=28, value=12, step=1)
 
-    st.header("Corte (início da curva)")
-    cut_Tmin = st.number_input("Cortar antes de T ≥ (°C)", value=0.0, step=0.1, format="%.1f")
-    cut_use = st.checkbox("Ativar corte por temperatura", value=False)
-    cut_Nfirst = st.number_input("Remover primeiros N pontos (após T ≥)", min_value=0, value=0, step=1)
-
-    st.header("Ajuste do início em Y")
-    y_target_enabled = st.checkbox("Fixar Y inicial em (m%)", value=True)
-    y_target_start = st.number_input("Valor alvo para o 1º ponto (m%)", min_value=0.0, value=100.0, step=0.1, format="%.1f")
-    y_offset = st.number_input("Offset adicional em Y (m%)", value=0.0, step=0.1, format="%.1f")
-
-    st.header("Suavização")
-    smoothing = st.selectbox("Método", ["Nenhum", "MediaMovel", "Savitzky-Golay" if SCIPY_OK else "Savitzky-Golay (SciPy ausente)"])
-    if smoothing == "MediaMovel":
-        ma_window = st.number_input("Janela média móvel (ímpar)", 3, 501, 11, 2)
-        sg_window, sg_poly = 21, 3
-    else:
-        ma_window = 11
-        if SCIPY_OK and smoothing.startswith("Savitzky-Golay"):
-            sg_window = st.number_input("Janela SG (ímpar)", 5, 501, 21, 2)
-            sg_poly = st.number_input("Ordem do polinômio SG", 2, 7, 3, 1)
-        else:
-            sg_window, sg_poly = 21, 3
-
-    st.header("Estilo global")
-    title_size = st.number_input("Tamanho do título", 6, 48, 16, 1)
-    label_size = st.number_input("Tamanho dos rótulos dos eixos", 6, 36, 14, 1)
-    tick_size = st.number_input("Tamanho dos ticks", 6, 28, 12, 1)
-    legend_size = st.number_input("Tamanho da legenda", 6, 28, 12, 1)
-
-    st.header("Faixas dos eixos")
-    # Aplicar pendências antes dos widgets
-    _pend = st.session_state.pop("_pending_ranges", None)
-    if _pend:
-        for _k, _v in _pend.items():
-            if _v is not None:
-                st.session_state[_k] = _v
+    st.markdown("---")
+    st.subheader("Limites dos eixos (inicial)")
     if "x_min" not in st.session_state: st.session_state["x_min"] = 0.0
     if "x_max" not in st.session_state: st.session_state["x_max"] = 1000.0
     if "y_min" not in st.session_state: st.session_state["y_min"] = 0.0
     if "y_max" not in st.session_state: st.session_state["y_max"] = 110.0
-    x_min = st.number_input("X min (°C)", key="x_min", step=1.0)
-    x_max = st.number_input("X max (°C)", key="x_max", step=1.0)
-    y_min = st.number_input("Y min (m%)", key="y_min", step=1.0)
-    y_max = st.number_input("Y max (m%)", key="y_max", step=1.0)
 
-    st.header("Exportação")
-    dpi_export = st.slider("DPI para exportação (PNG)", min_value=150, max_value=1200, value=600, step=50)
+    st.session_state["x_min"] = st.number_input("x_min (°C)", value=float(st.session_state["x_min"]))
+    st.session_state["x_max"] = st.number_input("x_max (°C)", value=float(st.session_state["x_max"]))
+    st.session_state["y_min"] = st.number_input("y_min (%)", value=float(st.session_state["y_min"]))
+    st.session_state["y_max"] = st.number_input("y_max (%)", value=float(st.session_state["y_max"]))
 
-tga_opts = TGAOptions(
-    assume_percent=assume_percent,
-    normalize_start=normalize_start,
-    smoothing="Savitzky-Golay" if (SCIPY_OK and smoothing.startswith("Savitzky-Golay")) else ("MediaMovel" if smoothing=="MediaMovel" else "Nenhum"),
-    ma_window=int(ma_window),
-    sg_window=int(sg_window),
-    sg_poly=int(sg_poly),
+uploaded_files = st.file_uploader(
+    "Envie 1 ou mais arquivos .txt/.csv",
+    type=["txt", "csv"],
+    accept_multiple_files=True
 )
-
-trim_opts = TrimAlignOptions(
-    cut_Tmin=float(cut_Tmin) if cut_use else None,
-    cut_Nfirst=int(cut_Nfirst),
-    y_target_start=float(y_target_start) if y_target_enabled else None,
-    y_offset=float(y_offset),
-)
-
-uploaded_files = st.file_uploader("Envie 1 ou mais arquivos .txt/.csv", type=["txt","csv"], accept_multiple_files=True)
 
 if uploaded_files:
-    all_processed: Dict[str, pd.DataFrame] = {}
-    mapping_per_file: Dict[str, Dict[str,str]] = {}
+    all_processed = {}
+    mapping_per_file = {}
 
     st.subheader("Mapeamento de Colunas")
     for f in uploaded_files:
-        df_raw, mapping_guess, header_row, sep_used = robust_read_to_df(f.getvalue(), decimal_hint=decimal_hint)
+        df_raw, mapping_guess, header_row, sep_used = robust_read_to_df(
+            f.getvalue(), decimal_hint=decimal_hint
+        )
         st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
 
+        # Normaliza duplicatas e tenta automap
+        df_raw, guess2 = _normalize_and_automap(df_raw)
+        if isinstance(mapping_guess, dict):
+            mapping_guess.update({k: v for k, v in guess2.items() if v})
+
         cols = list(df_raw.columns)
-        col_temp = st.selectbox(f"Temperatura ({f.name})", cols, index=(cols.index(mapping_guess.get("temperature")) if mapping_guess.get("temperature") in cols else 0), key=f"{f.name}_temp")
-        col_mass = st.selectbox(f"Massa (g/mg) ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass")) + 1) if mapping_guess.get("mass") in cols else 0), key=f"{f.name}_mass")
-        col_mpct = st.selectbox(f"Massa % ({f.name})", ["(nenhuma)"] + cols, index=((cols.index(mapping_guess.get("mass_pct")) + 1) if mapping_guess.get("mass_pct") in cols else 0), key=f"{f.name}_mpct")
+
+        # Selectboxes (temperatura obrigatória; massa/massa% opcionais)
+        # Use valores guessed quando possível
+        t_default = cols.index(mapping_guess.get("temperature", cols[0])) if cols else 0
+        col_temp = st.selectbox(
+            f"Temperatura ({f.name})",
+            cols, index=t_default,
+            key=f"{f.name}_temp"
+        )
+        mass_options = ["(nenhuma)"] + cols
+        m_default = mass_options.index(mapping_guess.get("mass")) if mapping_guess.get("mass") in cols else 0
+        col_mass = st.selectbox(
+            f"Massa (g/mg) ({f.name})",
+            mass_options, index=m_default,
+            key=f"{f.name}_mass"
+        )
+        mpct_options = ["(nenhuma)"] + cols
+        mp_default = mpct_options.index(mapping_guess.get("mass_pct")) if mapping_guess.get("mass_pct") in cols else 0
+        col_mpct = st.selectbox(
+            f"Massa % ({f.name})",
+            mpct_options, index=mp_default,
+            key=f"{f.name}_mpct"
+        )
 
         mapping = {"temperature": col_temp}
-        if col_mass != "(nenhuma)": mapping["mass"] = col_mass
-        if col_mpct != "(nenhuma)": mapping["mass_pct"] = col_mpct
+        if col_mass != "(nenhuma)":
+            mapping["mass"] = col_mass
+        if col_mpct != "(nenhuma)":
+            mapping["mass_pct"] = col_mpct
         mapping_per_file[f.name] = mapping
 
+        # Processar
         try:
-            df_proc = process_single(df_raw, mapping, tga_opts, trim_opts)
+            df_proc = process_single(df_raw, mapping, baseline_mode=baseline_mode)
             all_processed[f.name] = df_proc
         except Exception as e:
             st.error(f"{f.name}: erro — {e}")
 
-    if all_processed:
-        st.subheader("Modo de visualização")
-        view_mode = st.radio("Escolha como visualizar os gráficos:", ["Interativo (Plotly)", "Publicação (Matplotlib)"], index=0 if PLOTLY_OK else 1, horizontal=True)
+    if not all_processed:
+        st.stop()
 
-        st.subheader("Estilo por série e inclusão")
-        style_cfg: Dict[str, Dict[str, Optional[str]]] = {}
-        include_series: Dict[str, bool] = {}
-        for name in all_processed.keys():
-            with st.expander(name, expanded=True):
-                include = st.checkbox("Incluir na plotagem combinada", value=True, key=f"{name}_include")
-                label = st.text_input("Legenda (rótulo)", value=name.rsplit(".",1)[0], key=f"{name}_label")
-                color = st.color_picker("Cor da linha", value="#000000", key=f"{name}_color")
-                lw = st.number_input("Espessura da linha", min_value=0.5, max_value=10.0, value=2.0, step=0.5, key=f"{name}_lw")
-            include_series[name] = include
-            style_cfg[name] = {"label": label, "color": color, "lw": lw}
+    # --------- Configuração de estilo por série ----------
+    st.subheader("Estilo por Série")
+    default_colors = [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+        "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+        "#bcbd22", "#17becf"
+    ]
+    style_cfg = {}
+    include_series = {}
+    for i, (name, df_) in enumerate(all_processed.items()):
+        with st.expander(f"Série: {name}", expanded=False):
+            include_series[name] = st.checkbox("Incluir no gráfico", value=True, key=f"incl_{name}")
+            color = st.color_picker("Cor", value=default_colors[i % len(default_colors)], key=f"color_{name}")
+            lw = st.number_input("Espessura da linha", min_value=0.5, max_value=8.0, value=2.0, step=0.5, key=f"lw_{name}")
+            label = st.text_input("Rótulo (legenda)", value=name, key=f"label_{name}")
+            style_cfg[name] = {"color": color, "lw": lw, "label": label}
 
-        # ---------- Ajuste rápido (X/Y) ----------
-        def _nice_round(v, base=5.0, mode="floor"):
-            if not np.isfinite(v): 
-                return v
-            import math
-            if mode == "floor":
-                return base * math.floor(v / base)
-            elif mode == "ceil":
-                return base * math.ceil(v / base)
-            return v
-
-        def _compute_bounds(data_dict, include_dict):
-            xs, ys_tga, ys_dtg = [], [], []
-            for nm, d in data_dict.items():
-                if not include_dict.get(nm, True):
-                    continue
-                xs.append(d["Temperature"].to_numpy())
-                ys_tga.append(d["Mass_pct"].to_numpy())
-                ys_dtg.append(d["DTG_(-%/°C)"].to_numpy())
-            X = np.concatenate(xs) if xs else np.array([])
-            Yt = np.concatenate(ys_tga) if ys_tga else np.array([])
-            Yd = np.concatenate(ys_dtg) if ys_dtg else np.array([])
-            return X, Yt, Yd
-
-        st.subheader("Ajuste rápido (X/Y)")
-        Xall, Yt_all, Yd_all = _compute_bounds(all_processed, include_series)
-
-        cA, cB, cC, cD, cE = st.columns(5)
-        if cA.button("Auto (justo)"):
-            if Xall.size:
-                xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
-                _queue_ranges(_nice_round(xmin, 5.0, "floor"), _nice_round(xmax, 5.0, "ceil"), None, None)
-                st.rerun()
-            if Yt_all.size:
-                ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
-                _queue_ranges(None, None, _nice_round(ymin, 1.0, "floor"), _nice_round(ymax, 1.0, "ceil"))
-                st.rerun()
-
-        if cB.button("Auto (+10% margem)"):
-            if Xall.size:
-                xmin, xmax = float(np.nanmin(Xall)), float(np.nanmax(Xall))
-                pad = 0.1 * max(1e-9, xmax - xmin)
-                _queue_ranges(_nice_round(xmin - pad, 5.0, "floor"), _nice_round(xmax + pad, 5.0, "ceil"), None, None)
-                st.rerun()
-            if Yt_all.size:
-                ymin, ymax = float(np.nanmin(Yt_all)), float(np.nanmax(Yt_all))
-                pad = 0.1 * max(1e-9, ymax - ymin)
-                _queue_ranges(None, None, _nice_round(ymin - pad, 1.0, "floor"), _nice_round(ymax + pad, 1.0, "ceil"))
-                st.rerun()
-
-        if cC.button("Quantis 1–99%"):
-            if Xall.size:
-                xmin, xmax = np.nanquantile(Xall, 0.01), np.nanquantile(Xall, 0.99)
-                _queue_ranges(float(xmin), float(xmax), None, None)
-                st.rerun()
-            if Yt_all.size:
-                ymin, ymax = np.nanquantile(Yt_all, 0.01), np.nanquantile(Yt_all, 0.99)
-                _queue_ranges(None, None, float(ymin), float(ymax))
-                st.rerun()
-
-        if cD.button("Y = 0–100%"):
-            _queue_ranges(None, None, 0.0, 100.0)
-            st.rerun()
-
-        if cE.button("Redefinir (padrão)"):
-            _queue_ranges(0.0, 1000.0, 0.0, 110.0)
-            st.rerun()
-
-        # ---------- Funções para construir figuras Matplotlib (export/visualização) ----------
-        def build_matplotlib_fig(kind: str):
-            fig, ax = plt.subplots()
-            for name, d in all_processed.items():
-                if not include_series.get(name, True):
-                    continue
-                cfg = style_cfg[name]
-                if kind == "TGA":
-                    ax.plot(d["Temperature"], d["Mass_pct"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
-                    ax.set_ylabel("Massa (%)", fontsize=label_size)
-                    ax.set_title("TGA — Massa (%) vs Temperatura", fontsize=title_size)
-                    ax.set_ylim(st.session_state["y_min"], st.session_state["y_max"])
-                else:
-                    ax.plot(d["Temperature"], d["DTG_(-%/°C)"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
-                    ax.set_ylabel("-d(M%)/dT (%/°C)", fontsize=label_size)
-                    ax.set_title("DTG — Derivada da Massa (%)", fontsize=title_size)
-                ax.set_xlabel("Temperatura (°C)", fontsize=label_size)
-                ax.tick_params(axis="both", labelsize=tick_size)
-                ax.grid(True, linestyle="--", alpha=0.4)
-            ax.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
-            ax.legend(fontsize=legend_size)
-            return fig, ax
-
-        # ---------- Gráfico TGA ----------
-        st.subheader("Gráfico Combinado — TGA")
-        if view_mode.startswith("Interativo") and PLOTLY_OK:
-            fig1 = go.Figure()
-            for name, d in all_processed.items():
-                if not include_series.get(name, True):
-                    continue
-                cfg = style_cfg[name]
-                fig1.add_trace(go.Scatter(x=d["Temperature"], y=d["Mass_pct"], mode="lines",
-                                          name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
-            layout_kwargs_1 = dict(
-            template='plotly_white',
-            xaxis_title='Temperatura (°C)',
-            yaxis_title='Massa (%)',
-            title_text='TGA — Massa (%) vs Temperatura',
-            title_font_size=_coerce_int(title_size, 16),
-            )
-            xaxis_cfg_1 = dict(
-            tickfont=dict(size=_coerce_int(tick_size, 12)),
-            titlefont=dict(size=_coerce_int(label_size, 14)),
-            )
-            yaxis_cfg_1 = dict(
-            tickfont=dict(size=_coerce_int(tick_size, 12)),
-            titlefont=dict(size=_coerce_int(label_size, 14)),
-            )
-            x_min = _coerce_float(st.session_state.get('x_min'))
-            x_max = _coerce_float(st.session_state.get('x_max'))
-            y_min = _coerce_float(st.session_state.get('y_min'))
-            y_max = _coerce_float(st.session_state.get('y_max'))
-            if x_min is not None and x_max is not None:
-                            xaxis_cfg_1['range'] = [x_min, x_max]
-            if y_min is not None and y_max is not None:
-                            yaxis_cfg_1['range'] = [y_min, y_max]
-            layout_kwargs_1['xaxis'] = xaxis_cfg_1
-            layout_kwargs_1['yaxis'] = yaxis_cfg_1
-            legend_sz = _coerce_int(legend_size, None)
-            if legend_sz is not None:
-                            layout_kwargs_1['legend'] = dict(font=dict(size=legend_sz))
-            fig1.update_layout(**layout_kwargs_1)
-            st.plotly_chart(fig1, use_container_width=True, config={
-            'displaylogo': False,
-            'scrollZoom': True,
-            'modeBarButtonsToRemove': []  # mantém câmera, zoom, pan, +/-, autoscale, home
-            })
-        else:
-            fig1, ax1 = build_matplotlib_fig("TGA")
-            st.pyplot(fig1, clear_figure=True)
-
-        # ---------- Gráfico DTG ----------
-        st.subheader("Gráfico Combinado — DTG")
-        if view_mode.startswith("Interativo") and PLOTLY_OK:
-            fig2 = go.Figure()
-            for name, d in all_processed.items():
-                if not include_series.get(name, True):
-                    continue
-                cfg = style_cfg[name]
-                fig2.add_trace(go.Scatter(x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
-                                          name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
-            layout_kwargs_2 = dict(
-            template='plotly_white',
-            xaxis_title='Temperatura (°C)',
-            yaxis_title='-d(M%)/dT (%/°C)',
-            title_text='DTG — Derivada da Massa (%)',
-            title_font_size=_coerce_int(title_size, 16),
-            )
-            xaxis_cfg_2 = dict(
-            tickfont=dict(size=_coerce_int(tick_size, 12)),
-            titlefont=dict(size=_coerce_int(label_size, 14)),
-            )
-            x_min = _coerce_float(st.session_state.get('x_min'))
-            x_max = _coerce_float(st.session_state.get('x_max'))
-            if x_min is not None and x_max is not None:
-                xaxis_cfg_2['range'] = [x_min, x_max]
-            layout_kwargs_2['xaxis'] = xaxis_cfg_2
-            legend_sz2 = _coerce_int(legend_size, None)
-            if legend_sz2 is not None:
-                layout_kwargs_2['legend'] = dict(font=dict(size=legend_sz2))
-            fig2.update_layout(**layout_kwargs_2)
-            st.plotly_chart(fig2, use_container_width=True, config={
-                'displaylogo': False,
-                'scrollZoom': True,
-                'modeBarButtonsToRemove': []
-            })
-        else:
-            fig2, ax2 = build_matplotlib_fig("DTG")
-            st.pyplot(fig2, clear_figure=True)
-
-        # ---------- Exportação (Matplotlib sempre, para consistência de alta resolução) ----------
-        st.subheader("Exportação em alta resolução")
-        # Construir figuras para exporto (independente do modo atual)
-        fig1x, _ = build_matplotlib_fig("TGA")
-        fig2x, _ = build_matplotlib_fig("DTG")
-
-        buf_png1 = io.BytesIO()
-        fig1x.savefig(buf_png1, format="png", dpi=dpi_export, bbox_inches="tight")
-        buf_png1.seek(0)
-        buf_svg1 = io.BytesIO()
-        fig1x.savefig(buf_svg1, format="svg", bbox_inches="tight")
-        buf_svg1.seek(0)
-
-        buf_png2 = io.BytesIO()
-        fig2x.savefig(buf_png2, format="png", dpi=dpi_export, bbox_inches="tight")
-        buf_png2.seek(0)
-        buf_svg2 = io.BytesIO()
-        fig2x.savefig(buf_svg2, format="svg", bbox_inches="tight")
-        buf_svg2.seek(0)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("⬇️ Baixar TGA (PNG)", data=buf_png1, file_name="TGA_combinado.png", mime="image/png")
-            st.download_button("⬇️ Baixar DTG (PNG)", data=buf_png2, file_name="DTG_combinado.png", mime="image/png")
-        with c2:
-            st.download_button("⬇️ Baixar TGA (SVG)", data=buf_svg1, file_name="TGA_combinado.svg", mime="image/svg+xml")
-            st.download_button("⬇️ Baixar DTG (SVG)", data=buf_svg2, file_name="DTG_combinado.svg", mime="image/svg+xml")
-
-        # ---------- Dados Processados (CSV por arquivo) ----------
-        st.subheader("Dados Processados e Exportação (CSV)")
-        for name, d in all_processed.items():
-            st.markdown(f"**{name}** — {len(d)} pontos")
-            st.dataframe(d.head(30), use_container_width=True)
-            buf = io.StringIO()
-            d.to_csv(buf, index=False)
+            # Download CSV processado (individual)
             st.download_button(
-                label=f"⬇️ CSV processado — {name}",
-                data=buf.getvalue().encode("utf-8"),
-                file_name=f"{name.rsplit('.',1)[0]}_processado.csv",
+                "Baixar CSV processado",
+                data=df_.to_csv(index=False).encode("utf-8"),
+                file_name=f"{name}_processed.csv",
                 mime="text/csv",
+                key=f"dl_{name}"
             )
-else:
-    st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
+    # --------- Gráfico TGA ----------
+    st.subheader("Gráfico Combinado — TGA")
+    if PLOTLY_OK:
+        fig1 = go.Figure()
+        for name, d in all_processed.items():
+            if not include_series.get(name, True):
+                continue
+            cfg = style_cfg[name]
+            fig1.add_trace(go.Scatter(
+                x=d["Temperature"], y=d["Mass_pct"], mode="lines",
+                name=cfg["label"],
+                line=dict(color=cfg["color"], width=float(cfg["lw"]))
+            ))
+        apply_plotly_layout(
+            fig1,
+            title_text="TGA — Massa (%) vs Temperatura",
+            ytitle="Massa (%)",
+            title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
+        )
+        st.plotly_chart(fig1, use_container_width=True, config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": []  # mantém câmera, zoom, pan, +/-, autoscale, home
+        })
+    else:
+        fig1, ax1 = plt.subplots(figsize=(8, 5), dpi=110)
+        for name, d in all_processed.items():
+            if not include_series.get(name, True):
+                continue
+            cfg = style_cfg[name]
+            ax1.plot(d["Temperature"], d["Mass_pct"], label=cfg["label"], linewidth=float(cfg["lw"]))
+        ax1.set_xlabel("Temperatura (°C)", fontsize=label_size)
+        ax1.set_ylabel("Massa (%)", fontsize=label_size)
+        ax1.set_title("TGA — Massa (%) vs Temperatura", fontsize=title_size)
+        ax1.tick_params(axis="both", labelsize=tick_size)
+        ax1.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
+        ax1.set_ylim(st.session_state["y_min"], st.session_state["y_max"])
+        ax1.legend(fontsize=legend_size)
+        st.pyplot(fig1, clear_figure=True)
+
+    # --------- Gráfico DTG ----------
+    st.subheader("Gráfico Combinado — DTG")
+    if PLOTLY_OK:
+        fig2 = go.Figure()
+        for name, d in all_processed.items():
+            if not include_series.get(name, True):
+                continue
+            cfg = style_cfg[name]
+            fig2.add_trace(go.Scatter(
+                x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
+                name=cfg["label"],
+                line=dict(color=cfg["color"], width=float(cfg["lw"]))
+            ))
+        apply_plotly_layout(
+            fig2,
+            title_text="DTG — Derivada da Massa (%)",
+            ytitle="-d(M%)/dT (%/°C)",
+            title_size=title_size, label_size=label_size, tick_size=tick_size, legend_size=legend_size
+        )
+        st.plotly_chart(fig2, use_container_width=True, config={
+            "displaylogo": False,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": []
+        })
+    else:
+        fig2, ax2 = plt.subplots(figsize=(8, 5), dpi=110)
+        for name, d in all_processed.items():
+            if not include_series.get(name, True):
+                continue
+            cfg = style_cfg[name]
+            ax2.plot(d["Temperature"], d["DTG_(-%/°C)"], label=cfg["label"], linewidth=float(cfg["lw"]))
+        ax2.set_xlabel("Temperatura (°C)", fontsize=label_size)
+        ax2.set_ylabel("-d(M%)/dT (%/°C)", fontsize=label_size)
+        ax2.set_title("DTG — Derivada da Massa (%)", fontsize=title_size)
+        ax2.tick_params(axis="both", labelsize=tick_size)
+        ax2.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
+        ax2.legend(fontsize=legend_size)
+        st.pyplot(fig2, clear_figure=True)
+
+    # --------- Exportar todos os processados (ZIP simples em CSVs) ----------
+    st.subheader("Exportação em Lote")
+    import zipfile, os, tempfile
+    with tempfile.TemporaryDirectory() as td:
+        for name, d in all_processed.items():
+            d.to_csv(os.path.join(td, f"{name}_processed.csv"), index=False)
+        zip_path = os.path.join(td, "tga_dtg_processed.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name in all_processed.keys():
+                zf.write(os.path.join(td, f"{name}_processed.csv"), arcname=f"{name}_processed.csv")
+        with open(zip_path, "rb") as fh:
+            st.download_button(
+                "Baixar todos os CSVs (ZIP)",
+                data=fh.read(),
+                file_name="tga_dtg_processed.zip",
+                mime="application/zip"
+            )
 
 
 
