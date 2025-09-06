@@ -1,15 +1,12 @@
-# streamlit_tga_dtg_events.py
-# ------------------------------------------------------------
-# App TGA/DTG com mapeamento de colunas e gráficos robustos
-# ------------------------------------------------------------
 
+# streamlit_tga_dtg_events.py (hardened)
 import io
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Plotly (opcional; se não houver, cai para Matplotlib)
+# Plotly optional
 PLOTLY_OK = True
 try:
     import plotly.graph_objects as go
@@ -21,11 +18,8 @@ import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="TGA/DTG Viewer", layout="wide")
 
-
 # ------------------------ Helpers robustos ------------------------
-
 def _coerce_float(val, default=None):
-    """Converte para float com segurança (None ou '' -> default)."""
     try:
         if val is None:
             return default
@@ -35,9 +29,7 @@ def _coerce_float(val, default=None):
     except Exception:
         return default
 
-
 def _coerce_int(val, default=None):
-    """Converte para int com segurança (None ou '' -> default)."""
     try:
         if val is None:
             return default
@@ -47,13 +39,31 @@ def _coerce_int(val, default=None):
     except Exception:
         return default
 
+def _safe_font_size(x, default):
+    v = _coerce_int(x, default)
+    if v is None or (isinstance(v, float) and not np.isfinite(v)):
+        v = default
+    if v <= 0:
+        v = default
+    return int(v)
+
+def _sanitized_range(vmin, vmax):
+    vmin = _coerce_float(vmin, None)
+    vmax = _coerce_float(vmax, None)
+    if vmin is None or vmax is None:
+        return None
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return None
+    # swap if reversed
+    if vmin > vmax:
+        vmin, vmax = vmax, vmin
+    # expand tiny/zero span
+    if vmin == vmax:
+        eps = 1.0 if vmin == 0 else abs(vmin) * 1e-6 + 1e-6
+        return [float(vmin - eps), float(vmax + eps)]
+    return [float(vmin), float(vmax)]
 
 def _normalize_and_automap(df: pd.DataFrame):
-    """
-    1) Deduplica nomes de colunas preservando ordem (ex.: Weight -> Weight_1, ...)
-    2) Tenta automapear temperatura e massa/massa% quando possível (duas 'Weight').
-    Retorna (df_normalizado, mapping_guess_parcial)
-    """
     cols = [str(c).strip() for c in df.columns]
     seen, new_cols = {}, []
     for c in cols:
@@ -92,8 +102,12 @@ def _normalize_and_automap(df: pd.DataFrame):
             elif v2 > 50 and v1 < 50:
                 pct, mass = c2, c1
             else:
-                # fallback: coluna com maior máximo costuma ser % (inicia perto de 100)
-                pct, mass = (c1, c2) if pd.to_numeric(df[c1], errors="coerce").max() >= pd.to_numeric(df[c2], errors="coerce").max() else (c2, c1)
+                try:
+                    mx1 = pd.to_numeric(df[c1], errors="coerce").max()
+                    mx2 = pd.to_numeric(df[c2], errors="coerce").max()
+                    pct, mass = (c1, c2) if (mx1 if np.isfinite(mx1) else -np.inf) >= (mx2 if np.isfinite(mx2) else -np.inf) else (c2, c1)
+                except Exception:
+                    pct, mass = c1, c2
         else:
             pct, mass = c1, c2
 
@@ -113,64 +127,52 @@ def _normalize_and_automap(df: pd.DataFrame):
 
     return df, guess
 
-
 def apply_plotly_layout(fig, title_text, ytitle, title_size, label_size, tick_size, legend_size):
-    """
-    Aplica layout de modo robusto ao Plotly (sem ValueError quando inputs estão vazios).
-    """
     layout = dict(
         template="plotly_white",
         xaxis_title="Temperatura (°C)",
         yaxis_title=ytitle,
         title_text=title_text,
-        title_font_size=_coerce_int(title_size, 16),
+        title_font_size=_safe_font_size(title_size, 16),
     )
     xaxis = dict(
-        tickfont=dict(size=_coerce_int(tick_size, 12)),
-        titlefont=dict(size=_coerce_int(label_size, 14)),
+        tickfont=dict(size=_safe_font_size(tick_size, 12)),
+        titlefont=dict(size=_safe_font_size(label_size, 14)),
     )
     yaxis = dict(
-        tickfont=dict(size=_coerce_int(tick_size, 12)),
-        titlefont=dict(size=_coerce_int(label_size, 14)),
+        tickfont=dict(size=_safe_font_size(tick_size, 12)),
+        titlefont=dict(size=_safe_font_size(label_size, 14)),
     )
-    x_min = _coerce_float(st.session_state.get("x_min"))
-    x_max = _coerce_float(st.session_state.get("x_max"))
-    y_min = _coerce_float(st.session_state.get("y_min"))
-    y_max = _coerce_float(st.session_state.get("y_max"))
-    if x_min is not None and x_max is not None:
-        xaxis["range"] = [x_min, x_max]
-    if y_min is not None and y_max is not None:
-        yaxis["range"] = [y_min, y_max]
+
+    x_rng = _sanitized_range(st.session_state.get("x_min"), st.session_state.get("x_max"))
+    y_rng = _sanitized_range(st.session_state.get("y_min"), st.session_state.get("y_max"))
+    if x_rng is not None:
+        xaxis["range"] = x_rng
+    if y_rng is not None:
+        yaxis["range"] = y_rng
+
     layout["xaxis"] = xaxis
     layout["yaxis"] = yaxis
 
-    leg = _coerce_int(legend_size, None)
+    leg = _safe_font_size(legend_size, None)
     if leg is not None:
         layout["legend"] = dict(font=dict(size=leg))
 
     fig.update_layout(**layout)
 
-
 # ------------------------ Leitura robusta ------------------------
-
 def robust_read_to_df(content_bytes: bytes, decimal_hint: str = "."):
-    """
-    Lê TXT/CSV com separação por espaços múltiplos (\\s+) ou vírgulas/pontos-e-vírgulas.
-    Retorna: df, mapping_guess (vazio aqui), header_row(0), sep_used(str)
-    """
     text = content_bytes.decode("utf-8", errors="replace")
     decimal = "," if decimal_hint == "," else "."
     sep_used = r"\s+"
     header_row = 0
 
-    # Tentativa 1: whitespace (mais comum em exportações de TGA)
     try:
         df = pd.read_csv(io.StringIO(text), sep=r"\s+", engine="python", decimal=decimal)
         return df, {}, header_row, sep_used
     except Exception:
         pass
 
-    # Tentativa 2: vírgula
     try:
         df = pd.read_csv(io.StringIO(text), sep=",", engine="python", decimal=decimal)
         sep_used = ","
@@ -178,47 +180,37 @@ def robust_read_to_df(content_bytes: bytes, decimal_hint: str = "."):
     except Exception:
         pass
 
-    # Tentativa 3: ponto-e-vírgula
     df = pd.read_csv(io.StringIO(text), sep=";", engine="python", decimal=decimal)
     sep_used = ";"
     return df, {}, header_row, sep_used
 
-
-# ------------------------ Processamento de um arquivo ------------------------
-
+# ------------------------ Processamento ------------------------
 def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "first"):
-    """
-    Normaliza e retorna DataFrame processado com colunas:
-      - Temperature (float)
-      - Mass_pct (float)
-      - DTG_(-%/°C) (float)  -> derivada negativa de Mass_pct vs Temperature
-    """
-    # Coluna de temperatura
     t_col = mapping["temperature"]
     T = pd.to_numeric(df_raw[t_col].astype(str).str.replace(",", "."), errors="coerce")
 
-    # Massa % preferencialmente; senão, calcular a partir da massa absoluta
     mpct = None
-    if "mass_pct" in mapping:
-        mcol = mapping["mass_pct"]
-        if mcol in df_raw.columns:
-            mpct = pd.to_numeric(df_raw[mcol].astype(str).str.replace(",", "."), errors="coerce")
+    if "mass_pct" in mapping and mapping["mass_pct"] in df_raw.columns:
+        mpct = pd.to_numeric(df_raw[mapping["mass_pct"]].astype(str).str.replace(",", "."), errors="coerce")
 
     if mpct is None and "mass" in mapping and mapping["mass"] in df_raw.columns:
         mabs = pd.to_numeric(df_raw[mapping["mass"]].astype(str).str.replace(",", "."), errors="coerce")
+        base = None
         if baseline_mode == "first":
-            base = mabs.dropna().iloc[0] if len(mabs.dropna()) else np.nan
+            mnotna = mabs.dropna()
+            base = mnotna.iloc[0] if len(mnotna) else None
         else:
-            base = np.nanmax(mabs.values)
-        mpct = (mabs / base) * 100.0 if base and base != 0 else np.nan
+            try:
+                base = np.nanmax(mabs.values)
+            except Exception:
+                base = None
+        if base is not None and base != 0 and np.isfinite(base):
+            mpct = (mabs / base) * 100.0
 
-    # Se ainda assim não houver Mass_pct, aborta
     if mpct is None:
         raise ValueError("Coluna de massa/porcentagem não encontrada. Ajuste o mapeamento.")
 
-    # Cálculo do DTG: - d(M%)/dT
-    # Usamos gradient com T (em °C)
-    with np.errstate(invalid="ignore"):
+    with np.errstate(invalid="ignore", divide="ignore"):
         dt = np.gradient(T)
         dM = np.gradient(mpct)
         dtg = -dM / dt
@@ -228,12 +220,10 @@ def process_single(df_raw: pd.DataFrame, mapping: dict, baseline_mode: str = "fi
         "Mass_pct": mpct,
         "DTG_(-%/°C)": dtg
     })
-    out = out.dropna(subset=["Temperature", "Mass_pct"])  # T e M% são essenciais
+    out = out.dropna(subset=["Temperature", "Mass_pct"])
     return out
 
-
 # ------------------------ UI ------------------------
-
 st.title("TGA / DTG — Leitor e Plotador")
 
 with st.sidebar:
@@ -261,9 +251,7 @@ with st.sidebar:
     st.session_state["y_max"] = st.number_input("y_max (%)", value=float(st.session_state["y_max"]))
 
 uploaded_files = st.file_uploader(
-    "Envie 1 ou mais arquivos .txt/.csv",
-    type=["txt", "csv"],
-    accept_multiple_files=True
+    "Envie 1 ou mais arquivos .txt/.csv", type=["txt", "csv"], accept_multiple_files=True
 )
 
 if uploaded_files:
@@ -277,21 +265,19 @@ if uploaded_files:
         )
         st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
 
-        # Normaliza duplicatas e tenta automap
         df_raw, guess2 = _normalize_and_automap(df_raw)
         if isinstance(mapping_guess, dict):
             mapping_guess.update({k: v for k, v in guess2.items() if v})
 
         cols = list(df_raw.columns)
 
-        # Selectboxes (temperatura obrigatória; massa/massa% opcionais)
-        # Use valores guessed quando possível
         t_default = cols.index(mapping_guess.get("temperature", cols[0])) if cols else 0
         col_temp = st.selectbox(
             f"Temperatura ({f.name})",
             cols, index=t_default,
             key=f"{f.name}_temp"
         )
+
         mass_options = ["(nenhuma)"] + cols
         m_default = mass_options.index(mapping_guess.get("mass")) if mapping_guess.get("mass") in cols else 0
         col_mass = st.selectbox(
@@ -299,6 +285,7 @@ if uploaded_files:
             mass_options, index=m_default,
             key=f"{f.name}_mass"
         )
+
         mpct_options = ["(nenhuma)"] + cols
         mp_default = mpct_options.index(mapping_guess.get("mass_pct")) if mapping_guess.get("mass_pct") in cols else 0
         col_mpct = st.selectbox(
@@ -314,7 +301,6 @@ if uploaded_files:
             mapping["mass_pct"] = col_mpct
         mapping_per_file[f.name] = mapping
 
-        # Processar
         try:
             df_proc = process_single(df_raw, mapping, baseline_mode=baseline_mode)
             all_processed[f.name] = df_proc
@@ -324,7 +310,6 @@ if uploaded_files:
     if not all_processed:
         st.stop()
 
-    # --------- Configuração de estilo por série ----------
     st.subheader("Estilo por Série")
     default_colors = [
         "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
@@ -341,7 +326,6 @@ if uploaded_files:
             label = st.text_input("Rótulo (legenda)", value=name, key=f"label_{name}")
             style_cfg[name] = {"color": color, "lw": lw, "label": label}
 
-            # Download CSV processado (individual)
             st.download_button(
                 "Baixar CSV processado",
                 data=df_.to_csv(index=False).encode("utf-8"),
@@ -350,7 +334,7 @@ if uploaded_files:
                 key=f"dl_{name}"
             )
 
-    # --------- Gráfico TGA ----------
+    # --------- Gráfico TGA ---------
     st.subheader("Gráfico Combinado — TGA")
     if PLOTLY_OK:
         fig1 = go.Figure()
@@ -372,7 +356,7 @@ if uploaded_files:
         st.plotly_chart(fig1, use_container_width=True, config={
             "displaylogo": False,
             "scrollZoom": True,
-            "modeBarButtonsToRemove": []  # mantém câmera, zoom, pan, +/-, autoscale, home
+            "modeBarButtonsToRemove": []
         })
     else:
         fig1, ax1 = plt.subplots(figsize=(8, 5), dpi=110)
@@ -381,16 +365,18 @@ if uploaded_files:
                 continue
             cfg = style_cfg[name]
             ax1.plot(d["Temperature"], d["Mass_pct"], label=cfg["label"], linewidth=float(cfg["lw"]))
-        ax1.set_xlabel("Temperatura (°C)", fontsize=label_size)
-        ax1.set_ylabel("Massa (%)", fontsize=label_size)
-        ax1.set_title("TGA — Massa (%) vs Temperatura", fontsize=title_size)
-        ax1.tick_params(axis="both", labelsize=tick_size)
-        ax1.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
-        ax1.set_ylim(st.session_state["y_min"], st.session_state["y_max"])
-        ax1.legend(fontsize=legend_size)
+        ax1.set_xlabel("Temperatura (°C)", fontsize=_safe_font_size(14, 14))
+        ax1.set_ylabel("Massa (%)", fontsize=_safe_font_size(14, 14))
+        ax1.set_title("TGA — Massa (%) vs Temperatura", fontsize=_safe_font_size(16, 16))
+        ax1.tick_params(axis="both", labelsize=_safe_font_size(12, 12))
+        xr = _sanitized_range(st.session_state.get("x_min"), st.session_state.get("x_max"))
+        yr = _sanitized_range(st.session_state.get("y_min"), st.session_state.get("y_max"))
+        if xr: ax1.set_xlim(*xr)
+        if yr: ax1.set_ylim(*yr)
+        ax1.legend(fontsize=_safe_font_size(12, 12))
         st.pyplot(fig1, clear_figure=True)
 
-    # --------- Gráfico DTG ----------
+    # --------- Gráfico DTG ---------
     st.subheader("Gráfico Combinado — DTG")
     if PLOTLY_OK:
         fig2 = go.Figure()
@@ -421,15 +407,16 @@ if uploaded_files:
                 continue
             cfg = style_cfg[name]
             ax2.plot(d["Temperature"], d["DTG_(-%/°C)"], label=cfg["label"], linewidth=float(cfg["lw"]))
-        ax2.set_xlabel("Temperatura (°C)", fontsize=label_size)
-        ax2.set_ylabel("-d(M%)/dT (%/°C)", fontsize=label_size)
-        ax2.set_title("DTG — Derivada da Massa (%)", fontsize=title_size)
-        ax2.tick_params(axis="both", labelsize=tick_size)
-        ax2.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
-        ax2.legend(fontsize=legend_size)
+        ax2.set_xlabel("Temperatura (°C)", fontsize=_safe_font_size(14, 14))
+        ax2.set_ylabel("-d(M%)/dT (%/°C)", fontsize=_safe_font_size(14, 14))
+        ax2.set_title("DTG — Derivada da Massa (%)", fontsize=_safe_font_size(16, 16))
+        ax2.tick_params(axis="both", labelsize=_safe_font_size(12, 12))
+        xr = _sanitized_range(st.session_state.get("x_min"), st.session_state.get("x_max"))
+        if xr: ax2.set_xlim(*xr)
+        ax2.legend(fontsize=_safe_font_size(12, 12))
         st.pyplot(fig2, clear_figure=True)
 
-    # --------- Exportar todos os processados (ZIP simples em CSVs) ----------
+    # --------- Exportação em Lote ---------
     st.subheader("Exportação em Lote")
     import zipfile, os, tempfile
     with tempfile.TemporaryDirectory() as td:
@@ -446,6 +433,7 @@ if uploaded_files:
                 file_name="tga_dtg_processed.zip",
                 mime="application/zip"
             )
+
 
 
 
