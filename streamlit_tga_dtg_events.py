@@ -1,17 +1,19 @@
 # streamlit_tga_plotter.py
 # -*- coding: utf-8 -*-
 """
-App Streamlit para PLOTAR dados de TGA/DTG a partir de TXT/CSV.
-Novidades:
-- Cortar início por temperatura (Tmin) e/ou por N pontos
-- Ajuste do início em Y (re-escalar para Y0 alvo e offset opcional)
-- Estilo por série: cor, espessura e rótulo de legenda; incluir/excluir
-- Ajustes globais: tamanhos de fonte (título, eixos, ticks, legenda) e limites de eixos
-- Exportação em alta resolução (PNG/SVG) com DPI configurável
-- Gráficos combinados (TGA e DTG) com várias séries no mesmo plot
-
-Execução local:
-    streamlit run streamlit_tga_plotter.py
+TGA/DTG Plotter (TXT/CSV)
+- Múltiplos arquivos
+- Detecção de separador e vírgula decimal
+- Mapeamento automático + ajuste manual
+- Suavização (média móvel / Savitzky–Golay)
+- Correção de drift (linear) [opcional]
+- Corte de início (por T e/ou N pontos)
+- Alinhamento em Y (alvo para 1º ponto + offset)
+- Estilo por série (cor, espessura, rótulo, incluir)
+- Ajustes globais (fontes, faixas X/Y)
+- Presets 1‑clique para faixas (auto/quantis/0–100/Reset) com st.session_state seguro
+- Visualização: Plotly (interativo) ou Matplotlib (publicação)
+- Exportação alta resolução (PNG com DPI e SVG vetorial)
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Tente importar Savitzky-Golay; se não houver SciPy, usamos média móvel
+# SciPy (opcional)
 try:
     from scipy.signal import savgol_filter
     SCIPY_OK = True
@@ -33,11 +35,16 @@ except Exception:
     savgol_filter = None
     SCIPY_OK = False
 
+# Matplotlib
 import matplotlib.pyplot as plt
 
-# --- Helper para atualizar faixas de eixos com segurança ---
-def _queue_ranges(xmin=None, xmax=None, ymin=None, ymax=None):
-    st.session_state["_pending_ranges"] = {"x_min": xmin, "x_max": xmax, "y_min": ymin, "y_max": ymax}
+# Plotly (interativo)
+try:
+    import plotly.graph_objects as go
+    PLOTLY_OK = True
+except Exception:
+    go = None
+    PLOTLY_OK = False
 
 # --------------------- Leitura e Padronização ---------------------
 
@@ -46,18 +53,18 @@ KNOWN_HEADER_TOKENS = {
     "temp", "temperature", "temperatura",
     "weight", "weight%", "mass", "massa", "mass%", "mass_pct"
 }
-SEPARATORS = [r"\s+", "\t", ";", ","]
+SEPARATORS = [r"\\s+", "\\t", ";", ","]
 
 
 def has_decimal_comma(text: str) -> bool:
-    return bool(re.search(r"\d+,\d+", text))
+    return bool(re.search(r"\\d+,\\d+", text))
 
 
 def find_header_row(text: str) -> int:
     lines = text.splitlines()
     max_check = min(len(lines), 200)
     for i in range(max_check):
-        tokens = re.split(r"[;\t, ]+", lines[i].strip())
+        tokens = re.split(r"[;\\t, ]+", lines[i].strip())
         tokens_lc = {t.lower() for t in tokens if t}
         if tokens_lc & KNOWN_HEADER_TOKENS and len(tokens_lc) >= 2:
             return i
@@ -102,7 +109,7 @@ def robust_read_to_df(file_bytes: bytes, decimal_hint: Optional[str] = None) -> 
         return df, mapping, header_row, sep
 
     # fallback: largura fixa
-    df = pd.read_fwf(io.StringIO("\n".join(text.splitlines()[header_row:])), header=0)
+    df = pd.read_fwf(io.StringIO("\\n".join(text.splitlines()[header_row:])), header=0)
     df.columns = dedupe_columns(list(df.columns))
     mapping = auto_map_columns(df)
     return df, mapping, header_row, "fwf"
@@ -155,8 +162,8 @@ class TGAOptions:
 class TrimAlignOptions:
     cut_Tmin: Optional[float] = None
     cut_Nfirst: int = 0
-    y_target_start: Optional[float] = 100.0  # re-escala para que o 1º ponto = alvo (None desativa)
-    y_offset: float = 0.0  # offset aditivo em m% (não afeta DTG)
+    y_target_start: Optional[float] = 100.0  # re-escala 1º ponto para alvo (None desativa)
+    y_offset: float = 0.0  # offset aditivo em m%
 
 
 def to_percent_mass(mass: np.ndarray, assume_percent: bool, normalize_start: bool) -> np.ndarray:
@@ -188,7 +195,6 @@ def smooth_signal(y: np.ndarray, opts: TGAOptions, deriv: bool = False, x: Optio
         return ys
     elif opts.smoothing == "Savitzky-Golay":
         if not SCIPY_OK:
-            # fallback para média móvel
             return smooth_signal(y, TGAOptions(**{**opts.__dict__, "smoothing": "MediaMovel"}), deriv, x)
         w = max(5, int(opts.sg_window) | 1)
         p = max(2, int(opts.sg_poly))
@@ -227,12 +233,11 @@ def process_single(df: pd.DataFrame, mapping: Dict[str, str], tga_opts: TGAOptio
     if trim_opts.cut_Nfirst > 0:
         idxs = np.where(mask)[0]
         if len(idxs) > trim_opts.cut_Nfirst:
-            # zera os primeiros N pontos válidos
             mask[idxs[:trim_opts.cut_Nfirst]] = False
     T = T[mask]
     m_pct = m_pct[mask]
 
-    # --- Suavização e DTG (antes dos ajustes Y para preservar forma básica) ---
+    # --- Suavização e DTG ---
     m_pct_s = smooth_signal(m_pct, tga_opts, deriv=False, x=T)
     dtg = -smooth_signal(m_pct_s, tga_opts, deriv=True, x=T)
 
@@ -242,10 +247,9 @@ def process_single(df: pd.DataFrame, mapping: Dict[str, str], tga_opts: TGAOptio
         if abs(current) > 1e-12:
             scale = (float(trim_opts.y_target_start) / current)
             m_pct_s = m_pct_s * scale
-            dtg = dtg * scale  # derivada escala junto
+            dtg = dtg * scale
     if abs(trim_opts.y_offset) > 0:
         m_pct_s = m_pct_s + float(trim_opts.y_offset)
-        # Offset não altera derivada
 
     out = pd.DataFrame({
         "Temperature": T,
@@ -255,10 +259,15 @@ def process_single(df: pd.DataFrame, mapping: Dict[str, str], tga_opts: TGAOptio
     return out.dropna()
 
 
+# --- Helper para auto-range seguro ---
+def _queue_ranges(xmin=None, xmax=None, ymin=None, ymax=None):
+    st.session_state["_pending_ranges"] = {"x_min": xmin, "x_max": xmax, "y_min": ymin, "y_max": ymax}
+
+
 # --------------------- UI ---------------------
 
 st.set_page_config(page_title="TGA/DTG Plotter", layout="wide")
-st.title("📈 TGA/DTG Plotter (TXT/CSV) — v2")
+st.title("📈 TGA/DTG Plotter (TXT/CSV) — v3")
 
 st.markdown(
     """
@@ -306,7 +315,7 @@ with st.sidebar:
     legend_size = st.number_input("Tamanho da legenda", 6, 28, 12, 1)
 
     st.header("Faixas dos eixos")
-    # Aplicar pendências de ajuste rápido antes de criar widgets
+    # Aplicar pendências antes dos widgets
     _pend = st.session_state.pop("_pending_ranges", None)
     if _pend:
         for _k, _v in _pend.items():
@@ -322,7 +331,7 @@ with st.sidebar:
     y_max = st.number_input("Y max (m%)", key="y_max", step=1.0)
 
     st.header("Exportação")
-    dpi_export = st.slider("DPI para exportação", min_value=150, max_value=1200, value=600, step=50)
+    dpi_export = st.slider("DPI para exportação (PNG)", min_value=150, max_value=1200, value=600, step=50)
 
 tga_opts = TGAOptions(
     assume_percent=assume_percent,
@@ -352,22 +361,25 @@ if uploaded_files:
         st.markdown(f"**{f.name}** — cabeçalho na linha {header_row+1} • sep: `{sep_used}`")
 
         cols = list(df_raw.columns)
-        col_temp = st.selectbox(f"Temperatura ({f.name})", cols, index=cols.index(mapping_guess["temperature"]) if "temperature" in mapping_guess else 0, key=f"{f.name}_temp")
-        col_mass = st.selectbox(f"Massa (g/mg) ({f.name})", ["(nenhuma)"]+cols, index=(cols.index(mapping_guess["mass"])+1) if "mass" in mapping_guess else 0, key=f"{f.name}_mass")
-        col_mpct = st.selectbox(f"Massa % ({f.name})", ["(nenhuma)"]+cols, index=(cols.index(mapping_guess["mass_pct"])+1) if "mass_pct" in mapping_guess else 0, key=f"{f.name}_mpct")
+        col_temp = st.selectbox(f"Temperatura ({f.name})", cols, index=cols.index(mapping_guess.get(\"temperature\", cols[0])) if cols else 0, key=f\"{f.name}_temp\")
+        col_mass = st.selectbox(f\"Massa (g/mg) ({f.name})\", [\"(nenhuma)\"]+cols, index=(cols.index(mapping_guess.get(\"mass\"))+1) if mapping_guess.get(\"mass\") in cols else 0, key=f\"{f.name}_mass\")
+        col_mpct = st.selectbox(f\"Massa % ({f.name})\", [\"(nenhuma)\"]+cols, index=(cols.index(mapping_guess.get(\"mass_pct\"))+1) if mapping_guess.get(\"mass_pct\") in cols else 0, key=f\"{f.name}_mpct\")
 
-        mapping = {"temperature": col_temp}
-        if col_mass != "(nenhuma)": mapping["mass"] = col_mass
-        if col_mpct != "(nenhuma)": mapping["mass_pct"] = col_mpct
+        mapping = {\"temperature\": col_temp}
+        if col_mass != \"(nenhuma)\": mapping[\"mass\"] = col_mass
+        if col_mpct != \"(nenhuma)\": mapping[\"mass_pct\"] = col_mpct
         mapping_per_file[f.name] = mapping
 
         try:
             df_proc = process_single(df_raw, mapping, tga_opts, trim_opts)
             all_processed[f.name] = df_proc
         except Exception as e:
-            st.error(f"{f.name}: erro — {e}")
+            st.error(f\"{f.name}: erro — {e}\")
 
     if all_processed:
+        st.subheader("Modo de visualização")
+        view_mode = st.radio("Escolha como visualizar os gráficos:", ["Interativo (Plotly)", "Publicação (Matplotlib)"], index=0 if PLOTLY_OK else 1, horizontal=True)
+
         st.subheader("Estilo por série e inclusão")
         style_cfg: Dict[str, Dict[str, Optional[str]]] = {}
         include_series: Dict[str, bool] = {}
@@ -380,8 +392,7 @@ if uploaded_files:
             include_series[name] = include
             style_cfg[name] = {"label": label, "color": color, "lw": lw}
 
-
-        # ---------- Ajuste rápido de faixas (1 clique) ----------
+        # ---------- Ajuste rápido (X/Y) ----------
         def _nice_round(v, base=5.0, mode="floor"):
             if not np.isfinite(v): 
                 return v
@@ -400,18 +411,9 @@ if uploaded_files:
                 xs.append(d["Temperature"].to_numpy())
                 ys_tga.append(d["Mass_pct"].to_numpy())
                 ys_dtg.append(d["DTG_(-%/°C)"].to_numpy())
-            if xs:
-                X = np.concatenate(xs)
-            else:
-                X = np.array([])
-            if ys_tga:
-                Yt = np.concatenate(ys_tga)
-            else:
-                Yt = np.array([])
-            if ys_dtg:
-                Yd = np.concatenate(ys_dtg)
-            else:
-                Yd = np.array([])
+            X = np.concatenate(xs) if xs else np.array([])
+            Yt = np.concatenate(ys_tga) if ys_tga else np.array([])
+            Yd = np.concatenate(ys_dtg) if ys_dtg else np.array([])
             return X, Yt, Yd
 
         st.subheader("Ajuste rápido (X/Y)")
@@ -457,70 +459,129 @@ if uploaded_files:
         if cE.button("Redefinir (padrão)"):
             _queue_ranges(0.0, 1000.0, 0.0, 110.0)
             st.rerun()
-        
-                # ---------- Gráfico TGA ----------
-        st.subheader("Gráfico Combinado — TGA")
-        fig1, ax1 = plt.subplots()
-        for name, d in all_processed.items():
-            if not include_series.get(name, True):
-                continue
-            cfg = style_cfg[name]
-            ax1.plot(d["Temperature"], d["Mass_pct"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
-        ax1.set_xlabel("Temperatura (°C)", fontsize=label_size)
-        ax1.set_ylabel("Massa (%)", fontsize=label_size)
-        ax1.set_title("TGA — Massa (%) vs Temperatura", fontsize=title_size)
-        ax1.tick_params(axis='both', labelsize=tick_size)
-        ax1.grid(True, linestyle="--", alpha=0.4)
-        ax1.set_xlim(x_min, x_max)
-        ax1.set_ylim(y_min, y_max)
-        leg1 = ax1.legend(fontsize=legend_size)
-        st.pyplot(fig1, clear_figure=True)
 
-        # Export buttons
-        buf_png1 = io.BytesIO()
-        fig1.savefig(buf_png1, format="png", dpi=dpi_export, bbox_inches="tight")
-        buf_png1.seek(0)
-        buf_svg1 = io.BytesIO()
-        fig1.savefig(buf_svg1, format="svg", bbox_inches="tight")
-        buf_svg1.seek(0)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("⬇️ Baixar TGA (PNG)", data=buf_png1, file_name="TGA_combinado.png", mime="image/png")
-        with c2:
-            st.download_button("⬇️ Baixar TGA (SVG vetorial)", data=buf_svg1, file_name="TGA_combinado.svg", mime="image/svg+xml")
+        # ---------- Funções para construir figuras Matplotlib (export/visualização) ----------
+        def build_matplotlib_fig(kind: str):
+            fig, ax = plt.subplots()
+            for name, d in all_processed.items():
+                if not include_series.get(name, True):
+                    continue
+                cfg = style_cfg[name]
+                if kind == "TGA":
+                    ax.plot(d["Temperature"], d["Mass_pct"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
+                    ax.set_ylabel("Massa (%)", fontsize=label_size)
+                    ax.set_title("TGA — Massa (%) vs Temperatura", fontsize=title_size)
+                    ax.set_ylim(st.session_state["y_min"], st.session_state["y_max"])
+                else:
+                    ax.plot(d["Temperature"], d["DTG_(-%/°C)"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
+                    ax.set_ylabel("-d(M%)/dT (%/°C)", fontsize=label_size)
+                    ax.set_title("DTG — Derivada da Massa (%)", fontsize=title_size)
+                ax.set_xlabel("Temperatura (°C)", fontsize=label_size)
+                ax.tick_params(axis="both", labelsize=tick_size)
+                ax.grid(True, linestyle="--", alpha=0.4)
+            ax.set_xlim(st.session_state["x_min"], st.session_state["x_max"])
+            ax.legend(fontsize=legend_size)
+            return fig, ax
+
+        # ---------- Gráfico TGA ----------
+        st.subheader("Gráfico Combinado — TGA")
+        if view_mode.startswith("Interativo") and PLOTLY_OK:
+            fig1 = go.Figure()
+            for name, d in all_processed.items():
+                if not include_series.get(name, True):
+                    continue
+                cfg = style_cfg[name]
+                fig1.add_trace(go.Scatter(x=d["Temperature"], y=d["Mass_pct"], mode="lines",
+                                          name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
+            fig1.update_layout(
+                template="plotly_white",
+                xaxis_title="Temperatura (°C)", yaxis_title="Massa (%)",
+                title_text="TGA — Massa (%) vs Temperatura",
+                title_font_size=int(title_size),
+                xaxis=dict(range=[float(st.session_state['x_min']), float(st.session_state['x_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
+                yaxis=dict(range=[float(st.session_state['y_min']), float(st.session_state['y_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
+                legend=dict(font=dict(size=int(legend_size)))
+            )
+            st.plotly_chart(fig1, use_container_width=True, config={
+                'displaylogo': False,
+                'scrollZoom': True,
+                'modeBarButtonsToRemove': []  # mantém câmera, zoom, pan, +/-, autoscale, home
+            })
+        else:
+            fig1, ax1 = build_matplotlib_fig("TGA")
+            st.pyplot(fig1, clear_figure=True)
 
         # ---------- Gráfico DTG ----------
         st.subheader("Gráfico Combinado — DTG")
-        fig2, ax2 = plt.subplots()
-        for name, d in all_processed.items():
-            if not include_series.get(name, True):
-                continue
-            cfg = style_cfg[name]
-            ax2.plot(d["Temperature"], d["DTG_(-%/°C)"], label=cfg["label"], color=cfg["color"], linewidth=cfg["lw"])
-        ax2.set_xlabel("Temperatura (°C)", fontsize=label_size)
-        ax2.set_ylabel("-d(M%)/dT (%/°C)", fontsize=label_size)
-        ax2.set_title("DTG — Derivada da Massa (%)", fontsize=title_size)
-        ax2.tick_params(axis='both', labelsize=tick_size)
-        ax2.grid(True, linestyle="--", alpha=0.4)
-        ax2.set_xlim(x_min, x_max)
-        leg2 = ax2.legend(fontsize=legend_size)
-        st.pyplot(fig2, clear_figure=True)
+        if view_mode.startswith("Interativo") and PLOTLY_OK:
+            fig2 = go.Figure()
+            for name, d in all_processed.items():
+                if not include_series.get(name, True):
+                    continue
+                cfg = style_cfg[name]
+                fig2.add_trace(go.Scatter(x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
+                                          name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
+            fig2.update_layout(
+                template="plotly_white",
+                xaxis_title="Temperatura (°C)", yaxis_title="-d(M%)/dT (%/°C)",
+                title_text="DTG — Derivada da Massa (%)",
+                title_font_size=int(title_size),
+                xaxis=dict(range=[float(st.session_state['x_min']), float(st.session_state['x_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
+                legend=dict(font=dict(size=int(legend_size)))
+            )
+            st.plotly_chart(fig2, use_container_width=True, config={
+                'displaylogo': False,
+                'scrollZoom': True,
+                'modeBarButtonsToRemove': []
+            })
+        else:
+            fig2, ax2 = build_matplotlib_fig("DTG")
+            st.pyplot(fig2, clear_figure=True)
+
+        # ---------- Exportação (Matplotlib sempre, para consistência de alta resolução) ----------
+        st.subheader("Exportação em alta resolução")
+        # Construir figuras para exporto (independente do modo atual)
+        fig1x, _ = build_matplotlib_fig("TGA")
+        fig2x, _ = build_matplotlib_fig("DTG")
+
+        buf_png1 = io.BytesIO()
+        fig1x.savefig(buf_png1, format="png", dpi=dpi_export, bbox_inches="tight")
+        buf_png1.seek(0)
+        buf_svg1 = io.BytesIO()
+        fig1x.savefig(buf_svg1, format="svg", bbox_inches="tight")
+        buf_svg1.seek(0)
 
         buf_png2 = io.BytesIO()
-        fig2.savefig(buf_png2, format="png", dpi=dpi_export, bbox_inches="tight")
+        fig2x.savefig(buf_png2, format="png", dpi=dpi_export, bbox_inches="tight")
         buf_png2.seek(0)
         buf_svg2 = io.BytesIO()
-        fig2.savefig(buf_svg2, format="svg", bbox_inches="tight")
+        fig2x.savefig(buf_svg2, format="svg", bbox_inches="tight")
         buf_svg2.seek(0)
-        c3, c4 = st.columns(2)
-        with c3:
-            st.download_button("⬇️ Baixar DTG (PNG)", data=buf_png2, file_name="DTG_combinado.png", mime="image/png")
-        with c4:
-            st.download_button("⬇️ Baixar DTG (SVG vetorial)", data=buf_svg2, file_name="DTG_combinado.svg", mime="image/svg+xml")
 
-        st.caption("Dica: use SVG para edição vetorial em softwares como Inkscape/Illustrator; use PNG com DPI alto para publicação.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("⬇️ Baixar TGA (PNG)", data=buf_png1, file_name="TGA_combinado.png", mime="image/png")
+            st.download_button("⬇️ Baixar DTG (PNG)", data=buf_png2, file_name="DTG_combinado.png", mime="image/png")
+        with c2:
+            st.download_button("⬇️ Baixar TGA (SVG)", data=buf_svg1, file_name="TGA_combinado.svg", mime="image/svg+xml")
+            st.download_button("⬇️ Baixar DTG (SVG)", data=buf_svg2, file_name="DTG_combinado.svg", mime="image/svg+xml")
+
+        # ---------- Dados Processados (CSV por arquivo) ----------
+        st.subheader("Dados Processados e Exportação (CSV)")
+        for name, d in all_processed.items():
+            st.markdown(f"**{name}** — {len(d)} pontos")
+            st.dataframe(d.head(30), use_container_width=True)
+            buf = io.StringIO()
+            d.to_csv(buf, index=False)
+            st.download_button(
+                label=f"⬇️ CSV processado — {name}",
+                data=buf.getvalue().encode("utf-8"),
+                file_name=f"{name.rsplit('.',1)[0]}_processado.csv",
+                mime="text/csv",
+            )
 else:
     st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
 
 
 
