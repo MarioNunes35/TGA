@@ -27,6 +27,27 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# --- Safe casting helpers to avoid ValueError when inputs are blank/None ---
+def _coerce_float(val, default=None):
+    try:
+        if val is None:
+            return default
+        if isinstance(val, str) and val.strip() == "":
+            return default
+        return float(val)
+    except Exception:
+        return default
+
+def _coerce_int(val, default=None):
+    try:
+        if val is None:
+            return default
+        if isinstance(val, str) and val.strip() == "":
+            return default
+        return int(val)
+    except Exception:
+        return default
+
 # SciPy (opcional)
 try:
     from scipy.signal import savgol_filter
@@ -493,19 +514,39 @@ if uploaded_files:
                 cfg = style_cfg[name]
                 fig1.add_trace(go.Scatter(x=d["Temperature"], y=d["Mass_pct"], mode="lines",
                                           name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
-            fig1.update_layout(
-                template="plotly_white",
-                xaxis_title="Temperatura (°C)", yaxis_title="Massa (%)",
-                title_text="TGA — Massa (%) vs Temperatura",
-                title_font_size=int(title_size),
-                xaxis=dict(range=[float(st.session_state['x_min']), float(st.session_state['x_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
-                yaxis=dict(range=[float(st.session_state['y_min']), float(st.session_state['y_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
-                legend=dict(font=dict(size=int(legend_size)))
+            layout_kwargs_1 = dict(
+            template='plotly_white',
+            xaxis_title='Temperatura (°C)',
+            yaxis_title='Massa (%)',
+            title_text='TGA — Massa (%) vs Temperatura',
+            title_font_size=_coerce_int(title_size, 16),
             )
+            xaxis_cfg_1 = dict(
+            tickfont=dict(size=_coerce_int(tick_size, 12)),
+            titlefont=dict(size=_coerce_int(label_size, 14)),
+            )
+            yaxis_cfg_1 = dict(
+            tickfont=dict(size=_coerce_int(tick_size, 12)),
+            titlefont=dict(size=_coerce_int(label_size, 14)),
+            )
+            x_min = _coerce_float(st.session_state.get('x_min'))
+            x_max = _coerce_float(st.session_state.get('x_max'))
+            y_min = _coerce_float(st.session_state.get('y_min'))
+            y_max = _coerce_float(st.session_state.get('y_max'))
+            if x_min is not None and x_max is not None:
+                            xaxis_cfg_1['range'] = [x_min, x_max]
+            if y_min is not None and y_max is not None:
+                            yaxis_cfg_1['range'] = [y_min, y_max]
+            layout_kwargs_1['xaxis'] = xaxis_cfg_1
+            layout_kwargs_1['yaxis'] = yaxis_cfg_1
+            legend_sz = _coerce_int(legend_size, None)
+            if legend_sz is not None:
+                            layout_kwargs_1['legend'] = dict(font=dict(size=legend_sz))
+            fig1.update_layout(**layout_kwargs_1)
             st.plotly_chart(fig1, use_container_width=True, config={
-                'displaylogo': False,
-                'scrollZoom': True,
-                'modeBarButtonsToRemove': []  # mantém câmera, zoom, pan, +/-, autoscale, home
+            'displaylogo': False,
+            'scrollZoom': True,
+            'modeBarButtonsToRemove': []  # mantém câmera, zoom, pan, +/-, autoscale, home
             })
         else:
             fig1, ax1 = build_matplotlib_fig("TGA")
@@ -521,14 +562,26 @@ if uploaded_files:
                 cfg = style_cfg[name]
                 fig2.add_trace(go.Scatter(x=d["Temperature"], y=d["DTG_(-%/°C)"], mode="lines",
                                           name=cfg["label"], line=dict(color=cfg["color"], width=float(cfg["lw"])) ))
-            fig2.update_layout(
-                template="plotly_white",
-                xaxis_title="Temperatura (°C)", yaxis_title="-d(M%)/dT (%/°C)",
-                title_text="DTG — Derivada da Massa (%)",
-                title_font_size=int(title_size),
-                xaxis=dict(range=[float(st.session_state['x_min']), float(st.session_state['x_max'])], tickfont=dict(size=int(tick_size)), titlefont=dict(size=int(label_size))),
-                legend=dict(font=dict(size=int(legend_size)))
+            layout_kwargs_2 = dict(
+            template='plotly_white',
+            xaxis_title='Temperatura (°C)',
+            yaxis_title='-d(M%)/dT (%/°C)',
+            title_text='DTG — Derivada da Massa (%)',
+            title_font_size=_coerce_int(title_size, 16),
             )
+            xaxis_cfg_2 = dict(
+            tickfont=dict(size=_coerce_int(tick_size, 12)),
+            titlefont=dict(size=_coerce_int(label_size, 14)),
+            )
+            x_min = _coerce_float(st.session_state.get('x_min'))
+            x_max = _coerce_float(st.session_state.get('x_max'))
+            if x_min is not None and x_max is not None:
+                xaxis_cfg_2['range'] = [x_min, x_max]
+            layout_kwargs_2['xaxis'] = xaxis_cfg_2
+            legend_sz2 = _coerce_int(legend_size, None)
+            if legend_sz2 is not None:
+                layout_kwargs_2['legend'] = dict(font=dict(size=legend_sz2))
+            fig2.update_layout(**layout_kwargs_2)
             st.plotly_chart(fig2, use_container_width=True, config={
                 'displaylogo': False,
                 'scrollZoom': True,
@@ -581,6 +634,12 @@ if uploaded_files:
             )
 else:
     st.info("Envie um ou mais arquivos para visualizar TGA/DTG.")
+
+
+
+
+
+
 
 
 
